@@ -8,10 +8,8 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 	loadParameters();
 
-	// See: https://docs.opencv.org/4.x/d1/dcd/structcv_1_1aruco_1_1DetectorParameters.html
 	auto detectorParams = cv::aruco::DetectorParameters();
 
-	// See: https://docs.opencv.org/4.x/d1/d21/aruco__dictionary_8hpp.html
 	auto dictionary = cv::aruco::getPredefinedDictionary(_param_dictionary);
 
 	_detector = std::make_unique<cv::aruco::ArucoDetector>(dictionary, detectorParams);
@@ -21,10 +19,12 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 	// Subscribers
 	_image_sub = this->create_subscription<sensor_msgs::msg::Image>(
-			     "/camera", qos, std::bind(&ArucoTrackerNode::image_callback, this, std::placeholders::_1));
+			     "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image", 
+				 qos, std::bind(&ArucoTrackerNode::image_callback, this, std::placeholders::_1));
 
 	_camera_info_sub = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-				   "/camera_info", qos, std::bind(&ArucoTrackerNode::camera_info_callback, this, std::placeholders::_1));
+				   "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info", 
+					qos, std::bind(&ArucoTrackerNode::camera_info_callback, this, std::placeholders::_1));
 
 	// Publishers
 	_image_pub = this->create_publisher<sensor_msgs::msg::Image>(
