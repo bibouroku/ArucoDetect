@@ -6,6 +6,11 @@ ArucoTrackerNode::ArucoTrackerNode()
 {
 	RCLCPP_INFO(this->get_logger(), "Starting ArucoTrackerNode");
 
+	_camera_correction_matrix = (cv::Mat_<double>(3, 3) <<
+         0,  0,  1,
+        -1,  0,  0,
+         0, -1,  0);
+
 	loadParameters();
 
 	auto detectorParams = cv::aruco::DetectorParameters();
@@ -31,6 +36,8 @@ ArucoTrackerNode::ArucoTrackerNode()
 			     "/image_proc", qos);
 	_target_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>(
 				   "/target_pose", qos);
+	// TF broadcaster
+	//_tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 }
 
 void ArucoTrackerNode::loadParameters()
@@ -92,11 +99,12 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 				_target[1] = tvec[1];
 				_target[2] = tvec[2];
 
+				
 
 				// Publish target pose
 				geometry_msgs::msg::PoseStamped target_pose;
 				target_pose.header.stamp = msg->header.stamp;
-				target_pose.header.frame_id = "camera_frame"; // TODO: frame_id
+				target_pose.header.frame_id = "camera_link"; // TODO: frame_id
 
 				// Camera frame is RBU
 				target_pose.pose.position.x = _target[0];
@@ -108,6 +116,7 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 
 				// Quaternion from rotation matrix
 				if (rot_mat.type() == CV_64FC1 && rot_mat.rows == 3 && rot_mat.cols == 3) {
+					cv::Mat rot_mat_ros = _camera_correction_matrix * rot_mat;
 					cv::Quatd quat = cv::Quatd::createFromRotMat(rot_mat).normalize();
 					target_pose.pose.orientation.x = quat.x;
 					target_pose.pose.orientation.y = quat.y;
@@ -115,6 +124,24 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 					target_pose.pose.orientation.w = quat.w;
 
 					_target_pose_pub->publish(target_pose);
+					// geometry_msgs::msg::TransformStamped tf_msg;
+					// tf_msg.header.stamp = msg->header.stamp;
+					// tf_msg.header.frame_id = "camera_link";
+					// tf_msg.child_frame_id = "aruco_marker";
+					// double ocv_x = tvec[0];
+					// double ocv_y = tvec[1];
+					// double ocv_z = tvec[2];
+					// // 将 OpenCV 坐标系 (Z-fwd, X-right, Y-down) 转换为
+					// // ROS 标准相机坐标系 (X-fwd, Y-left, Z-up)
+					// tf_msg.transform.translation.x = ocv_z;    // OpenCV 的 Z 轴 对应 ROS 的 X 轴
+					// tf_msg.transform.translation.y = -ocv_x;   // OpenCV 的 X 轴 对应 ROS 的 -Y 轴 (左)
+					// tf_msg.transform.translation.z = -ocv_y;   // OpenCV 的 Y 轴 对应 ROS 的 -Z 轴 (上)
+					// tf_msg.transform.rotation.x = target_pose.pose.orientation.x;
+					// tf_msg.transform.rotation.y = target_pose.pose.orientation.y;
+					// tf_msg.transform.rotation.z = target_pose.pose.orientation.z;
+					// tf_msg.transform.rotation.w = target_pose.pose.orientation.w;
+
+					// _tf_broadcaster->sendTransform(tf_msg);
 
 				} else {
 					RCLCPP_ERROR(this->get_logger(), "Rotation matrix malformed!");

@@ -1,0 +1,8 @@
+digraph G {
+"camera_link" -> "aruco_marker"[label=" Broadcaster: default_authority\nAverage rate: 27.534\nBuffer length: 5.012\nMost recent transform: 1761902318.480282\nOldest transform: 1761902313.468206\n"];
+"base_link" -> "camera_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1761902318.483941"[ shape=plaintext ] ;
+}->"base_link";
+}

@@ -9,6 +9,9 @@
 #include <opencv2/aruco.hpp>
 #include <opencv2/core/quaternion.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <opencv4/opencv2/objdetect/aruco_detector.hpp>
 
 class ArucoTrackerNode : public rclcpp::Node
 {
@@ -40,5 +43,10 @@ private:
 	int _param_aruco_id {};
 	int _param_dictionary {};
 	double _param_marker_size {};
+
+	//tf broadcaster
+	//std::unique_ptr<tf2_ros::TransformBroadcaster> _tf_broadcaster;
+
+	cv::Mat _camera_correction_matrix;
 };
 
