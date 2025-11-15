@@ -1,5 +1,8 @@
 #include "drone_tracker.hpp"
 
+static constexpr double STATIONARY_THRESHOLD_M = 0.05; // 5厘米，位置变化小于这个值被认为是静止
+static constexpr double STATIONARY_DURATION_S = 5.0;   // 5秒，静止超过这个时间触发降落
+
 using namespace std::chrono_literals;
 
 DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controller"),current_state(State::IDLE)
@@ -7,6 +10,12 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
     offboard_control_mode_publisher_ = this->create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
     trajectory_setpoint_publisher_ = this->create_publisher<TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
     vehicle_command_publisher_ = this->create_publisher<VehicleCommand>("/fmu/in/vehicle_command", 10);
+
+    //初始化原始位姿发布方
+    pj_raw_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/tracking/raw_pose", 10);
+    //初始化滤波后位姿发布方
+    pj_est_velocity_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/tracking/estimated_velocity", 10);
+    pj_filtered_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/tracking/filtered_pose", 10);
 
     auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
     subscription_ = this->create_subscription<geometry_msgs::msg::PoseStamped>("/target_pose",qos,std::bind(&DroneTrackerController::pose_callback, this, std::placeholders::_1));
@@ -37,9 +46,23 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
     // tf_buffer_->setUsingDedicatedThread(true); 
 
     // tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_,this,false);
-    offboard_setpoint_counter_ = 0;
     reference_z_captured_ = false;
     last_offboard_state_  = false;
+
+    double q_std = this->declare_parameter<double>("kf.q_std", 0.3);
+    double r_std = this->declare_parameter<double>("kf.r_std", 0.01);
+    double dt = this->declare_parameter<double>("kf.dt", 0.03);
+    kf_filter_ = std::make_unique<KFTrackerCore>(this->get_logger(), q_std, r_std, dt);
+    
+    // 初始化速度和时间戳相关变量
+    _vehicle_velocity_ned = Eigen::Vector3d::Zero();
+    _last_odometry_stamp = this->now();
+    _last_filtered_position = Eigen::Vector3d::Zero();
+    _last_filter_time = this->now();
+    
+    // 前向预测时间参数
+    _prediction_horizon = this->declare_parameter<double>("tracking.prediction_horizon", 0.35);
+
 
     /*auto timer_callback = [this]() -> void {
         //publish_transform();
@@ -58,7 +81,8 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
         ----------------状态机实现逻辑----------------
 
     };*/
-    timer_ = this->create_wall_timer(100ms, std::bind(&DroneTrackerController::run_state_machine, this));
+    _last_tag_move_time = this->now();
+    timer_ = this->create_wall_timer(30ms, std::bind(&DroneTrackerController::run_state_machine, this));
 }
 
 void DroneTrackerController::run_state_machine()
@@ -120,18 +144,87 @@ void DroneTrackerController::run_tracking_state()
         publish_trajectory_setpoint(_last_seen_tag.position.x(), _last_seen_tag.position.y(), HEIGHT);
         return;
     }
-    
+
     // 发布目标位置作为设定点
-    publish_trajectory_setpoint(_tag.position.x(), _tag.position.y(), HEIGHT);
-    RCLCPP_INFO(this->get_logger(), "TRACKING: Following tag at [%.2f, %.2f, %.2f]",
-                _tag.position.x(), _tag.position.y(), HEIGHT);
+    // publish_trajectory_setpoint(_tag.position.x(), _tag.position.y(), HEIGHT);
+    // RCLCPP_INFO(this->get_logger(), "TRACKING: Following tag at [%.2f, %.2f, %.2f]",
+    //             _tag.position.x(), _tag.position.y(), HEIGHT);
+
+    
+    // ✅ 关键修复：使用卡尔曼滤波估计的速度进行前向预测
+    if (!kf_filter_->isInitialized()) {
+        return;
+    }
+    
+    auto filtered_state = kf_filter_->getFilteredState();
+    
+    Eigen::Vector3d current_filtered_position(
+        filtered_state.pose.pose.position.x,
+        filtered_state.pose.pose.position.y,
+        filtered_state.pose.pose.position.z
+    );
+    
+    // ✅ 关键修复：第一次运行时，初始化 _last_filtered_position 并返回
+    rclcpp::Time current_time = this->now();
+    double dt_since_last = (current_time - _last_filter_time).seconds();
+    
+    if (dt_since_last < 0.01)  // 第一次调用或间隔太短，初始化状态
+    {
+        _last_filtered_position = current_filtered_position;
+        _last_filter_time = current_time;
+        return;
+    }
+
+    Eigen::Vector3d predicted_position = current_filtered_position;
+    Eigen::Vector3d velocity_estimate = Eigen::Vector3d::Zero();
+
+    //计算滤波器估计的速度（基于位置变化）
+    if (dt_since_last > 0.02 && dt_since_last < 0.5)
+    {
+        velocity_estimate = (current_filtered_position - _last_filtered_position) / dt_since_last;
+        // 清零 Z 方向速度（小车在地面，Z不动）
+        velocity_estimate.z() = 0.0;
+
+        // 进行前向预测（补偿测量和处理延迟）
+        predicted_position = current_filtered_position + velocity_estimate * _prediction_horizon;
+        
+        double speed_xy = std::sqrt(velocity_estimate.x() * velocity_estimate.x() + 
+                                    velocity_estimate.y() * velocity_estimate.y());
+        RCLCPP_INFO(this->get_logger(), 
+                    "[VELOCITY] vx=%.4f, vy=%.4f, speed_xy=%.4f m/s, dt=%.3f s, horizon=%.3f s, predicted_delta=[%.4f, %.4f]",
+                    velocity_estimate.x(), velocity_estimate.y(), speed_xy, dt_since_last,
+                    _prediction_horizon,
+                    velocity_estimate.x() * _prediction_horizon,
+                    velocity_estimate.y() * _prediction_horizon);
+
+        // ✅ 发布估计的速度（用于 PlotJuggler）
+        geometry_msgs::msg::Twist vel_msg;
+        vel_msg.linear.x = velocity_estimate.x();
+        vel_msg.linear.y = velocity_estimate.y();
+        vel_msg.linear.z = 0.0;
+        pj_est_velocity_pub_->publish(vel_msg);
+    }
+
+    
+
+    // ✅ 重要：更新上一次滤波位置和时间（必须在速度计算和使用之后）
+    _last_filtered_position = current_filtered_position;
+    _last_filter_time = current_time;
+    
+    // 发布预测位置而不是当前位置
+    publish_trajectory_setpoint(predicted_position.x(), predicted_position.y(), HEIGHT);
+    
+    RCLCPP_INFO(this->get_logger(), 
+                "TRACKING: Following tag at [%.3f, %.3f, %.2f] (predicted)",
+                predicted_position.x(), predicted_position.y(), HEIGHT);
 
     // 检查是否满足进入降落状态的条件
-    /*if (is_directly_above_target()) {
-        RCLCPP_INFO(this->get_logger(), "Directly above target, preparing to descend.");
-        _last_seen_tag = _tag; // 锁定降落目标位置
+    if ((this->now() - _last_tag_move_time).seconds() > STATIONARY_DURATION_S &&
+        is_directly_above_target()) {
+        RCLCPP_INFO(this->get_logger(), "Tag has been stationary for %.1f seconds. Initiating DESCEND state.",
+                    STATIONARY_DURATION_S);
         switchToState(State::DESCEND);
-    }*/
+    }
 }
 
 // 检查是否在目标正上方
@@ -149,6 +242,7 @@ bool DroneTrackerController::has_landed() const
     // 更好的实现会检查z速度是否也接近0
     return _vehicle_position_ned.z() > LAND_THRESHOLD_Z;
 }
+
 void DroneTrackerController::run_descend_state()
 {
     publish_offboard_control_mode();
@@ -200,15 +294,74 @@ void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped
                                                msg->pose.orientation.x,
                                                msg->pose.orientation.y,
                                                msg->pose.orientation.z);
-    tag_camera.timestamp = this->now();
+    tag_camera.timestamp = msg->header.stamp;
     _tag = getTagWorld(tag_camera);
+
+    geometry_msgs::msg::PoseStamped::SharedPtr initial_msg = std::make_shared<geometry_msgs::msg::PoseStamped>();
+    initial_msg->header.stamp = _tag.timestamp;
+    initial_msg->pose.position.x = _tag.position.x();
+    initial_msg->pose.position.y = _tag.position.y();
+    initial_msg->pose.position.z = _tag.position.z();
+    initial_msg->pose.orientation.x = _tag.orientation.x();
+    initial_msg->pose.orientation.y = _tag.orientation.y();
+    initial_msg->pose.orientation.z = _tag.orientation.z();
+    initial_msg->pose.orientation.w = _tag.orientation.w();
+    // 发布原始位姿
+    geometry_msgs::msg::PoseStamped raw_msg;
+    raw_msg.header = initial_msg->header;
+    raw_msg.pose = initial_msg->pose;
+    pj_raw_pose_pub_->publish(raw_msg);
+    // // ✅ 添加延迟诊断信息
+    // rclcpp::Time current_time = this->now();
+    // double measurement_delay = (current_time - msg->header.stamp).seconds();
+    // if (measurement_delay > 0.01)  // 延迟 > 10ms 时输出
+    // {
+    //     RCLCPP_WARN(this->get_logger(), 
+    //                 "[DELAY DETECTED] Measurement delay: %.1f ms | Meas time: %.3f | Current time: %.3f",
+    //                 measurement_delay * 1000.0, msg->header.stamp.seconds(), current_time.seconds());
+    // }
+    
+    // 使用卡尔曼滤波器进行位置和速度估计
+    kf_filter_->updateWithMeasurement(initial_msg);
+    if (!kf_filter_->isInitialized()) {
+        return;
+    }
+
+    // 2. 从滤波器获取平滑后的位姿
+    filtered_pose = kf_filter_->getFilteredState();
+
+    // 发布滤波后位姿
+    geometry_msgs::msg::PoseStamped filtered_msg;
+    filtered_msg.header = filtered_pose.header;
+    filtered_msg.pose = filtered_pose.pose.pose;;
+    pj_filtered_pose_pub_->publish(filtered_msg);
+    
     _last_tag_seen_time = this->now();
-    _last_seen_tag = _tag;
-    RCLCPP_INFO(this->get_logger(), "Transform from ned to april tag:");
+    _last_seen_tag = _tag; 
+    if (_is_first_tag_detection)
+    {
+        _last_stable_tag_position = _tag;
+        _last_tag_move_time = this->now();
+        _is_first_tag_detection = false;
+    }
+    else
+    {
+        double distance_moved = (_tag.position - _last_stable_tag_position.position).norm();
+        if (distance_moved > STATIONARY_THRESHOLD_M)
+        {
+            _last_tag_move_time = this->now();
+            _last_stable_tag_position = _tag;
+        }
+    }
+    RCLCPP_INFO(this->get_logger(), "Transform from ned to april tag(filtered):");
+    // RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
+    //             _tag.position.x(),
+    //             _tag.position.y(),
+    //             _tag.position.z());
     RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
-                _tag.position.x(),
-                _tag.position.y(),
-                _tag.position.z());
+                filtered_pose.pose.pose.position.x,
+                filtered_pose.pose.pose.position.y,
+                filtered_pose.pose.pose.position.z);
 
 }
 DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const ArucoTag& tag_camera) {
@@ -217,6 +370,12 @@ DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const Aruco
         1, 0, 0,
         0, 0, 1;
     Eigen::Quaterniond quat_NED(R);
+
+    // 计算测量时间和当前时间的差值
+    rclcpp::Time meas_time = tag_camera.timestamp;
+    rclcpp::Time current_time = this->now();
+    double time_diff = (current_time - meas_time).seconds();
+
     auto vehicle_position = Eigen::Vector3d(_vehicle_position_ned.cast<double>());
     auto vehicle_orientation = Eigen::Quaterniond(_vehicle_orientation.cast<double>());
     Eigen::Affine3d drone_transform = Eigen::Translation3d(vehicle_position) * vehicle_orientation;
@@ -233,6 +392,14 @@ DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const Aruco
     tag_world.position = tag_transform_world.translation();
     tag_world.orientation = Eigen::Quaterniond(tag_transform_world.rotation());
     tag_world.timestamp = tag_camera.timestamp;
+    
+    // 调试输出
+    if(time_diff > 0.01)  // 如果延迟 > 10ms 才输出
+    {
+        RCLCPP_WARN(this->get_logger(), 
+                    "Measurement delay detected: %.3f ms", time_diff * 1000.0);
+    }
+
     return tag_world;
 }
 
@@ -304,6 +471,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
     // tf_broadcaster_->sendTransform(transform);
     _vehicle_position_ned = Eigen::Vector3d(msg->position[0], msg->position[1], msg->position[2]);
     _vehicle_orientation = Eigen::Quaterniond(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
+    _vehicle_velocity_ned = Eigen::Vector3d(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
+    _last_odometry_stamp = rclcpp::Time(msg->timestamp);
+    
     base_x = msg->position[0];
     base_y = msg->position[1];
     base_z = msg->position[2];

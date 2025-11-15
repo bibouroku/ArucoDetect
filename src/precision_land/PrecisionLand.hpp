@@ -56,6 +56,7 @@ private:
 		Search, 	// Searches for target using a search pattern
 		Approach, 	// Positioning over landing target while maintaining altitude
 		Descend, 	// Stay over landing target while descending
+		Finished
 	};
 
 	void switchToState(State state);

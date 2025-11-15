@@ -36,6 +36,9 @@ using namespace px4_msgs::msg;
 #include <vector>
 #include <Eigen/Geometry>
 
+#include "kf_tracker/kf_tracker_lib.hpp"
+#include <memory> // 为了 std::unique_ptr
+
 using namespace std::chrono_literals;
 
 class DroneTrackerController : public rclcpp::Node
@@ -51,6 +54,11 @@ private:
 	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr subscription_;
     rclcpp::Subscription<VehicleControlMode>::SharedPtr vehicle_control_mode_subscriber_;
+
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pj_raw_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pj_filtered_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pj_est_velocity_pub_;
+
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odometry_sub_;
@@ -77,6 +85,9 @@ private:
     const float DESCEND_THRESHOLD_XY = 0.2f; // 水平距离小于这个值时开始下降 (米)
     const float LAND_THRESHOLD_Z = -0.1f; // 高度小于这个值时认为已降落 (米)
 
+    std::unique_ptr<KFTrackerCore> kf_filter_;
+    geometry_msgs::msg::PoseWithCovarianceStamped filtered_pose;
+
     struct ArucoTag {
 		Eigen::Vector3d position;
 		Eigen::Quaterniond orientation;
@@ -86,6 +97,9 @@ private:
 	};
     ArucoTag _tag;
     ArucoTag _last_seen_tag; // 用于降落时锁定目标
+    ArucoTag _last_stable_tag_position; //用于存储二维码上一个的稳定位置
+    rclcpp::Time _last_tag_move_time; //记录二维码最后一次移动的时间
+    bool _is_first_tag_detection {true};
     
     enum class State{
         IDLE,
@@ -97,6 +111,12 @@ private:
 
     Eigen::Vector3d _vehicle_position_ned;
     Eigen::Quaterniond _vehicle_orientation;
+    Eigen::Vector3d _vehicle_velocity_ned;              // 无人机速度
+    rclcpp::Time _last_odometry_stamp;                 // 最新里程计时间戳
+    Eigen::Vector3d _last_filtered_position;           // 上一次滤波位置（用于速度计算）
+    rclcpp::Time _last_filter_time;                    // 上一次滤波时间
+    double _prediction_horizon = 0.1;                  // 前向预测时间（秒）
+    
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
