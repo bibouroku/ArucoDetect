@@ -13,11 +13,11 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 	loadParameters();
 
-	auto detectorParams = cv::aruco::DetectorParameters();
+	auto detectorParams = cv::aruco::DetectorParameters(); //创建OpenCV ArUco检测器参数对象
 
-	auto dictionary = cv::aruco::getPredefinedDictionary(_param_dictionary);
+	auto dictionary = cv::aruco::getPredefinedDictionary(_param_dictionary); //获取预定义的Aruco字典
 
-	_detector = std::make_unique<cv::aruco::ArucoDetector>(dictionary, detectorParams);
+	_detector = std::make_unique<cv::aruco::ArucoDetector>(dictionary, detectorParams); //创建Aruco检测器实例
 
 	// RMW QoS settings
 	auto qos = rclcpp::QoS(1).best_effort();
@@ -29,18 +29,18 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 	_camera_info_sub = this->create_subscription<sensor_msgs::msg::CameraInfo>(
 				   "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info", 
-					qos, std::bind(&ArucoTrackerNode::camera_info_callback, this, std::placeholders::_1));
+					qos, std::bind(&ArucoTrackerNode::camera_info_callback, this, std::placeholders::_1)); 	
 
 	// Publishers
 	_image_pub = this->create_publisher<sensor_msgs::msg::Image>(
-			     "/image_proc", qos);
+			     "/image_proc", qos); //发布处理后的图像
 	_target_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-				   "/target_pose", qos);
+				   "/target_pose", qos); //发布目标位姿
 	// TF broadcaster
 	//_tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 }
 
-void ArucoTrackerNode::loadParameters()
+void ArucoTrackerNode::loadParameters() 
 {
 	declare_parameter<int>("aruco_id", 0);
 	declare_parameter<int>("dictionary", 2); // DICT_4X4_250
@@ -55,7 +55,7 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 {
 	try {
 		// Convert ROS image message to OpenCV image
-		cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+		cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8); //转换为BGR8编码格式的OpenCV图像
 
 		// Detect markers
 		std::vector<int> ids;
@@ -68,7 +68,7 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 			// Calculate marker Pose and draw axes
 
 			std::vector<std::vector<cv::Point2f>> undistortedCorners;
-
+			
 			for (const auto& corner : corners) {
 				std::vector<cv::Point2f> undistortedCorner;
 				cv::undistortPoints(corner, undistortedCorner, _camera_matrix, _dist_coeffs, cv::noArray(), _camera_matrix);

@@ -414,24 +414,89 @@ void KFTrackerCore::initKF()
 
 bool KFTrackerCore::predict()
 {
-   kf_state_pred_.x = F_*kf_state_pred_.x;
-   if(kf_state_pred_.x.norm() > 10000.0)
+   // kf_state_pred_.x = F_*kf_state_pred_.x;
+   // if(kf_state_pred_.x.norm() > 10000.0)
+   // {
+   //    RCLCPP_ERROR(logger_, "State prediction exploded!!!");
+   //    is_state_initialized_ = false;
+   //    initKF();
+   //    return false;
+   // }
+   // kf_state_pred_.P = F_*kf_state_pred_.P*F_.transpose() + Q_;
+   
+   // //使用当前测量的时间戳作为预测状态的时间
+   // // 这样状态缓冲中的时间戳与实际物理时间对齐
+   // kf_state_pred_.time_stamp = z_meas_.time_stamp; 
+   // updateStateBuffer();
+   
+   // if(debug_)
+   // {
+   //    RCLCPP_INFO(logger_, "[KF PREDICT] x=%.3f, y=%.3f, z=%.3f | vx=%.4f, vy=%.4f, vz=%.4f | buf_size=%zu",
+   //                kf_state_pred_.x(0), kf_state_pred_.x(1), kf_state_pred_.x(2),
+   //                kf_state_pred_.x(3), kf_state_pred_.x(4), kf_state_pred_.x(5),
+   //                state_buffer_.size());
+   // }
+   // return true;
+   // 改进：使用实际时间差而不是固定步长
+   // 这避免了多步累积导致位置过度推进的问题
+   
+   double cur_t = kf_state_pred_.time_stamp.seconds();
+   double meas_t = z_meas_.time_stamp.seconds();
+   double dt_actual = meas_t - cur_t;
+   
+   // 若测量时间不比当前预测时间更新，无需预测
+   if (dt_actual <= 0.0)
+   {
+      if(debug_)
+         RCLCPP_INFO(logger_, "[KF PREDICT] Skipped (dt_actual=%.6f <= 0)", dt_actual);
+      return true;
+   }
+   
+   // 核心改进：用实际的 dt_actual 而不是固定的 dt_pred_
+   // 这样预测的位移 = v * dt_actual，更精确
+   // 但为了保持 Q 矩阵的一致性，我们仍然用 dt_pred_ 来缩放 Q
+   
+   // 创建临时的 F 矩阵，用实际的 dt_actual
+   Eigen::MatrixXd F_actual = Eigen::MatrixXd::Identity(6, 6);
+   F_actual(0, 3) = dt_actual;
+   F_actual(1, 4) = dt_actual;
+   F_actual(2, 5) = dt_actual;
+   
+   // 创建与实际 dt 相符的 Q
+   Eigen::MatrixXd Q_actual = Eigen::MatrixXd::Zero(6, 6);
+   Q_actual(0,0) = 1./3.*dt_actual*dt_actual*dt_actual;
+   Q_actual(0,3) = 0.5*dt_actual*dt_actual;
+   Q_actual(1,1) = 1./3.*dt_actual*dt_actual*dt_actual;
+   Q_actual(1,4) = 0.5*dt_actual*dt_actual;
+   Q_actual(2,2) = 1./3.*dt_actual*dt_actual*dt_actual;
+   Q_actual(2,5) = 0.5*dt_actual*dt_actual;
+   Q_actual(3,0) = Q_actual(0,3);
+   Q_actual(3,3) = dt_actual;
+   Q_actual(4,1) = Q_actual(1,4);
+   Q_actual(4,4) = dt_actual;
+   Q_actual(5,2) = Q_actual(2,5);
+   Q_actual(5,5) = dt_actual;
+   Q_actual = q_*q_*Q_actual;
+   
+   // 执行单步预测（使用实际 dt）
+   kf_state_pred_.x = F_actual * kf_state_pred_.x;
+   if (kf_state_pred_.x.norm() > 10000.0)
    {
       RCLCPP_ERROR(logger_, "State prediction exploded!!!");
       is_state_initialized_ = false;
       initKF();
       return false;
    }
-   kf_state_pred_.P = F_*kf_state_pred_.P*F_.transpose() + Q_;
+   kf_state_pred_.P = F_actual * kf_state_pred_.P * F_actual.transpose() + Q_actual;
    
-   // ✅ 修复：使用当前测量的时间戳作为预测状态的时间
-   // 这样状态缓冲中的时间戳与实际物理时间对齐
-   kf_state_pred_.time_stamp = z_meas_.time_stamp; 
+   // 更新时间戳到测量时刻
+   kf_state_pred_.time_stamp = z_meas_.time_stamp;
    updateStateBuffer();
    
    if(debug_)
    {
-      RCLCPP_INFO(logger_, "[KF PREDICT] x=%.3f, y=%.3f, z=%.3f | vx=%.4f, vy=%.4f, vz=%.4f | buf_size=%zu",
+      RCLCPP_INFO(logger_, "[KF PREDICT] dt_actual=%.6f, x=%.3f, y=%.3f, z=%.3f | vx=%.4f, vy=%.4f, vz=%.4f | buf_size=%zu",
+                  dt_actual,
                   kf_state_pred_.x(0), kf_state_pred_.x(1), kf_state_pred_.x(2),
                   kf_state_pred_.x(3), kf_state_pred_.x(4), kf_state_pred_.x(5),
                   state_buffer_.size());
