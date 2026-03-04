@@ -591,7 +591,7 @@ void KFTrackerCore::update(void)
          
          if(debug_)
          {
-            RCLCPP_INFO(logger_, "[UPDATE] Buffer[%zu] time=%.4f, measurement time=%.4f, diff=%.4f", 
+            RCLCPP_INFO(logger_, "[UPDATE] Buffer[%zu] time=%.4f, measurement time=%.4f, diff=%.4f",
                         i, state_buffer_[i].time_stamp.seconds(), current_z.time_stamp.seconds(), time_diff);
          }
          

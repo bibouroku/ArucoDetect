@@ -9,6 +9,8 @@
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
 #include "px4_msgs/msg/vehicle_odometry.hpp"
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+
 #include <stdint.h>
 #include <iostream>
 
@@ -48,74 +50,59 @@ using namespace std::chrono_literals;
 class DisturbanceObserver
 {
 public:
-    // 构造函数
-    // mass: 无人机质量 (kg)
-    // K: 观测器增益矩阵的对角值 (对应论文中的 lambda_i [cite: 228])，通常取 2.0 - 5.0
-    // dt: 控制周期 (s)
-    DisturbanceObserver(double mass, double K, double dt)
-        : mass_(mass), K_(K), dt_(dt)
+    // K_I_diag: 分轴增益 [Kx, Ky, Kz]（对应论文里 K_I 对角元），建议 2~8 起步
+    DisturbanceObserver(double mass, const Eigen::Vector3d& K_I_diag, double dt)
+        : mass_(mass), K_I_diag_(K_I_diag), dt_(dt)
     {
-        fe_est_ = Eigen::Vector3d::Zero();
-
-        beta_ = (dt_ * K_) / mass_;
-        if (beta_ > 1.0) {
-            beta_ = 1.0; // 限制 beta 不超过 1
+        fe_hat_ = Eigen::Vector3d::Zero();
+        // 论文离散实现中出现 dt/(2m) * K_I
+        alpha_ = (dt_ / (2.0 * mass_)) * K_I_diag_;
+        // 限幅，避免数值发散（尤其 dt 抖或 K 过大）
+        for (int i = 0; i < 3; ++i) {
+            if (alpha_(i) < 0.0) alpha_(i) = 0.0;
+            if (alpha_(i) > 1.0) alpha_(i) = 1.0;
         }
     }
-    /**
-     * @brief 更新观测器 (基于论文公式 15)
-     * * @param accel_inertial   惯性系下的加速度 (m/s^2)。注意：这是测量值，通常来自 IMU 去除重力后的加速度 + 重力向量，或者直接微分速度。
-     * 在 PX4 中，这通常是 (Velocity_new - Velocity_old) / dt。
-     * @param R_body_to_earth  机体到惯性系(NED)的旋转矩阵 (对应论文中的 R(eta) 
-     * @param thrust_force_n   总推力 (牛顿)。注意：PX4 发出的是 normalized thrust (0-1)，你需要乘一个系数转成牛顿。
-     */
-    void update(const Eigen::Vector3d& accel_inertial,
-                const Eigen::Matrix3d& R_body_to_earth,
-                double thrust_force_n)
+
+    void reset(const Eigen::Vector3d& fe0 = Eigen::Vector3d::Zero()) {
+        fe_hat_ = fe0;
+    }
+
+    // accel_ned: NED惯性系加速度 (m/s^2)，必须是 “p_ddot”
+    // R_b2n: body -> NED 的旋转矩阵
+    // u_f: 总推力幅值 (N)，正数
+    void update(const Eigen::Vector3d& accel_ned,
+                const Eigen::Matrix3d& R_b2n,
+                double u_f)
     {
-        // 1. 计算重力向量 (NED坐标系下重力是正 Z 方向)
-        // 论文公式 q(4) 中 g = [0, 0, -mg0]^T (假设Z向上) [cite: 188]
-        // 但在 PX4 NED 中，g = [0, 0, 9.8 * m]^T
-        Eigen::Vector3d g_vec(0.0, 0.0, 9.81 * mass_);
+        // NED 下重力向量：+Z 方向（向下）为正
+        const Eigen::Vector3d g_vec(0.0, 0.0, 9.81 * mass_);
 
-        // 2. 计算推力向量在惯性系下的表示
-        // 论文公式 (15) 中的 u_f * z_b 
-        // z_b 是机体坐标系的 Z 轴在惯性系下的方向，即旋转矩阵的第三列 [cite: 228]
-        // 在 PX4 NED 中，推力通常指向机体 -Z 方向 (向上)，所以推力产生的力是 R * [0, 0, -T]^T
-        // 或者简单理解：推力向量 = R * [0, 0, -thrust_magnitude]
-        Eigen::Vector3d thrust_body(0.0, 0.0, -thrust_force_n);
-        Eigen::Vector3d thrust_inertial = R_body_to_earth * thrust_body;
+        // z_b：机体系 z 轴在 NED 下方向 = R 的第3列
+        const Eigen::Vector3d z_b = R_b2n.col(2);
 
-        // 3. 计算“瞬时干扰力” (Raw Disturbance)
-        // 动力学方程: F_total = m * a
-        // F_total = F_gravity + F_thrust + F_disturbance
-        // 所以: F_disturbance = m * a - F_gravity - F_thrust
-        // 这对应论文公式 (15) 的括号部分: (m*p_dotdot - g + u_f*z_b)
-        // 注意符号：论文里把 u_f*z_b 当作输入项，我们这里根据 NED 习惯做减法
-        
-        Eigen::Vector3d raw_disturbance = (mass_ * accel_inertial) - g_vec - thrust_inertial;
+        // 论文的“瞬时外力样本”：m*a - g + u_f*z_b
+        // 在 NED 中：推力方向通常为 -z_b，所以 thrust_vector = -u_f*z_b
+        // m*a = thrust_vector + g + f_e  => f_e = m*a - g - thrust_vector = m*a - g + u_f*z_b
+        const Eigen::Vector3d fe_inst = (mass_ * accel_ned) - g_vec + (u_f * z_b);
 
-        // 4. 执行低通滤波 (论文公式 15 的离散化形式)
-        // fe(k+1) = (1 - beta) * fe(k) + beta * raw_disturbance
-        fe_est_ = (1.0 - beta_) * fe_est_ + beta_ * raw_disturbance;
+        // 论文式(15)的一阶离散形式（分轴）：
+        // fe_hat(k+1) = (I - alpha) * fe_hat(k) + alpha * fe_inst
+        // 其中 alpha = dt/(2m) * K_I
+        for (int i = 0; i < 3; ++i) {
+            fe_hat_(i) = (1.0 - alpha_(i)) * fe_hat_(i) + alpha_(i) * fe_inst(i);
+        }
     }
 
-    // 获取估计的干扰加速度 (用于前馈补偿)
-    // 论文估算的是力 f_e，我们要补偿的是加速度 a_comp = -f_e / m
-    Eigen::Vector3d getDisturbanceAcceleration() const {
-        return fe_est_ / mass_;
-    }
+    Eigen::Vector3d getDisturbanceForce() const { return fe_hat_; }        // N
+    Eigen::Vector3d getDisturbanceAcceleration() const { return fe_hat_ / mass_; } // m/s^2
 
-    // 获取估计的干扰力 (牛顿)
-    Eigen::Vector3d getDisturbanceForce() const {
-        return fe_est_;
-    }
 private:
     double mass_;
-    double K_;
+    Eigen::Vector3d K_I_diag_;
     double dt_;
-    double beta_;
-    Eigen::Vector3d fe_est_;
+    Eigen::Vector3d alpha_;
+    Eigen::Vector3d fe_hat_;
 };
 
 class DroneTrackerController : public rclcpp::Node
@@ -181,10 +168,20 @@ private:
     enum class State{
         IDLE,
         ARMING,
+        HOLDING,
         TRACKING,
         DESCEND,
     };
     State current_state = State::IDLE;
+    double hold_duration_sec_ = 4.5;
+    bool hold_inited_ = false;
+    rclcpp::Time hold_start_time_;
+    double hold_kp_ = 1.0;
+    double hold_ki_ = 0.0;
+    Eigen::Vector3d hold_pos_ned_;
+    Eigen::Vector3d hold_int_err_ = Eigen::Vector3d::Zero();  // 可选：PI
+    bool offboard_and_arm_sent_ = false; // 记录是否已经发送过切换到 Offboard 模式和解锁的命令
+    Eigen::Vector3d target_pos;
 
     Eigen::Vector3d _vehicle_position_ned;
     Eigen::Quaterniond _vehicle_orientation;
@@ -199,12 +196,16 @@ private:
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
 
+        
+    rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr vehicle_local_pos_sub_;
+    // 声明变量存储加速度
+    Eigen::Vector3d _vehicle_accel_ned = Eigen::Vector3d::Zero();
+
     //成员函数
     void pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     void publish_offboard_control_mode();
     void publish_trajectory_setpoint(float x, float y, float z);
-    void publish_full_trajectory_setpoint(float x, float y, float z,
-                                          float vx, float vy, float vz,
+    void publish_full_trajectory_setpoint(float vx, float vy, float vz,
                                           float ax, float ay, float az);
     void publish_transform();
     void lookup_transform();
@@ -218,6 +219,7 @@ private:
     void run_state_machine();
     void run_idle_state();
     void run_arming_state();
+    void run_holding_state();
     void run_tracking_state();
     void run_descend_state();
     //void run_landed_state();
