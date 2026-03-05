@@ -375,7 +375,7 @@ void DroneTrackerController::run_tracking_state()
     vel_error.z() = 0.0 - _vehicle_velocity_ned.z();
 
     // v_cmd = Kp * (p_sp - p) + Kd * (v_ff - v)
-    Eigen::Vector3d v_cmd = _kp * pos_error + _kd * vel_error;
+    Eigen::Vector3d v_cmd = _kp * pos_error + _kd * vel_error + target_vel_ff;  //加上速度前馈
 
     // 速度限幅（按需调参）
     const double vxy_max = 2.5;
