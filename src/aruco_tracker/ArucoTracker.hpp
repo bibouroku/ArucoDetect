@@ -48,5 +48,13 @@ private:
 	//std::unique_ptr<tf2_ros::TransformBroadcaster> _tf_broadcaster;
 
 	cv::Mat _camera_correction_matrix;
+
+	// 终端仪表盘
+	bool _dashboard_inited{false};
+	int _dashboard_row0{0};      // 仪表盘起始行（可选）
+	rclcpp::Time _last_dash_print;
+	double _dash_hz{10.0};       // 更新频率（10Hz够用）
+	void init_dashboard();
+	void update_dashboard(int aruco_id,bool detected,const cv::Vec3d& tvec, const cv::Vec3d& rvec,const builtin_interfaces::msg::Time& timestamp);
 };
 

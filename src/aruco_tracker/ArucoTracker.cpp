@@ -24,11 +24,13 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 	// Subscribers
 	_image_sub = this->create_subscription<sensor_msgs::msg::Image>(
-			     "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image", 
+			    //  "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image", 
+				 "/camera1/image_raw",
 				 qos, std::bind(&ArucoTrackerNode::image_callback, this, std::placeholders::_1));
 
 	_camera_info_sub = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-				   "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info", 
+				//    "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info",
+				   "/camera_info", 
 					qos, std::bind(&ArucoTrackerNode::camera_info_callback, this, std::placeholders::_1)); 	
 
 	// Publishers
@@ -44,11 +46,85 @@ void ArucoTrackerNode::loadParameters()
 {
 	declare_parameter<int>("aruco_id", 0);
 	declare_parameter<int>("dictionary", 2); // DICT_4X4_250
-	declare_parameter<double>("marker_size", 0.5);
+	// declare_parameter<double>("marker_size", 0.5);
+	declare_parameter<double>("marker_size", 0.14); // 6.4cm
 
 	get_parameter("aruco_id", _param_aruco_id);
 	get_parameter("dictionary", _param_dictionary);
 	get_parameter("marker_size", _param_marker_size);
+}
+void ArucoTrackerNode::init_dashboard()
+{
+    if (_dashboard_inited) return;
+    _dashboard_inited = true;
+
+    // 清屏 + 光标回到左上（可选）
+    std::cout << "\033[2J\033[H";
+
+    std::cout << "-------------------- Detection ------------------------------\n";
+    std::cout << "aruco_id      : \n";
+    std::cout << "detected      : \n";
+    std::cout << "pos (m)       : x=     y=     z=    \n";
+    std::cout << "rvec (rad)    : rx=    ry=    rz=   \n";
+    std::cout << "stamp (sec)   : \n";
+    std::cout << "-------------------------------------------------------------\n";
+    std::cout.flush();
+}
+
+static void print_fixed_field(int row, int col, const std::string& text, int clear_width = 60)
+{
+    // row/col 从 1 开始（ANSI 标准）
+    std::cout << "\033[" << row << ";" << col << "H";
+    // 清理该行从当前位置往后的残留字符
+    std::cout << std::string(clear_width, ' ');
+    std::cout << "\033[" << row << ";" << col << "H";
+    std::cout << text;
+}
+
+void ArucoTrackerNode::update_dashboard(int aruco_id,
+                                        bool detected,
+                                        const cv::Vec3d& tvec,
+                                        const cv::Vec3d& rvec,
+                                        const builtin_interfaces::msg::Time& stamp)
+{
+    init_dashboard();
+
+    // 控制刷新频率，避免刷太快（可选）
+    auto now = this->now();
+    if (_last_dash_print.nanoseconds() != 0) {
+        double dt = (now - _last_dash_print).seconds();
+        if (dt < (1.0 / _dash_hz)) return;
+    }
+    _last_dash_print = now;
+
+    // 仪表盘从屏幕第 1 行开始算：标题=1
+    // 你上面 init_dashboard 打印了 7 行，所以这里固定写死行号即可
+    print_fixed_field(2, 16, std::to_string(aruco_id));
+    print_fixed_field(3, 16, detected ? "true" : "false");
+
+    {
+        std::ostringstream ss;
+        ss.setf(std::ios::fixed);
+        ss << std::setprecision(3)
+           << "x=" << tvec[0] << "  y=" << tvec[1] << "  z=" << tvec[2];
+        print_fixed_field(4, 16, ss.str());
+    }
+
+    {
+        std::ostringstream ss;
+        ss.setf(std::ios::fixed);
+        ss << std::setprecision(3)
+           << "rx=" << rvec[0] << "  ry=" << rvec[1] << "  rz=" << rvec[2];
+        print_fixed_field(5, 16, ss.str());
+    }
+
+    {
+        std::ostringstream ss;
+        ss << stamp.sec << "." << std::setw(9) << std::setfill('0') << stamp.nanosec;
+        print_fixed_field(6, 16, ss.str());
+    }
+
+    std::cout.flush();
 }
 
 void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -58,10 +134,10 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 		cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8); //转换为BGR8编码格式的OpenCV图像
 
 		// Detect markers
-		std::vector<int> ids;
-		std::vector<std::vector<cv::Point2f>> corners;
-		_detector->detectMarkers(cv_ptr->image, corners, ids);
-		cv::aruco::drawDetectedMarkers(cv_ptr->image, corners, ids);
+		std::vector<int> ids; //存储检测到的Aruco标记的ID
+		std::vector<std::vector<cv::Point2f>> corners; //存储检测到的Aruco标记的角点
+		_detector->detectMarkers(cv_ptr->image, corners, ids); //使用Aruco检测器检测标记
+		cv::aruco::drawDetectedMarkers(cv_ptr->image, corners, ids); 
 
 
 		if (!_camera_matrix.empty() && !_dist_coeffs.empty()) {
@@ -99,7 +175,7 @@ void ArucoTrackerNode::image_callback(const sensor_msgs::msg::Image::SharedPtr m
 				_target[1] = tvec[1];
 				_target[2] = tvec[2];
 
-				
+				update_dashboard(ids[i], true, tvec, rvec, msg->header.stamp);
 
 				// Publish target pose
 				geometry_msgs::msg::PoseStamped target_pose;
@@ -187,7 +263,7 @@ void ArucoTrackerNode::camera_info_callback(const sensor_msgs::msg::CameraInfo::
 		    _camera_matrix.at<double>(0, 0), // fx
 		    _camera_matrix.at<double>(1, 1), // fy
 		    _camera_matrix.at<double>(0, 2), // cx
-		    _camera_matrix.at<double>(1, 2)  // cy
+		    _camera_matrix.at<double>(1, 2)  // cy	
 		   );
 
 	// Check if focal length is zero after update
@@ -216,7 +292,7 @@ void ArucoTrackerNode::annotate_image(cv_bridge::CvImagePtr image)
 	cv::Size textSize = cv::getTextSize(text_xyz, fontFace, fontScale, thickness, &baseline);
 	baseline += thickness;
 	cv::Point textOrg((image->image.cols - textSize.width - 10), (image->image.rows - 10));
-	cv::putText(image->image, text_xyz, textOrg, fontFace, fontScale, cv::Scalar(0, 255, 255), thickness, 8);
+	cv::putText(image->image, text_xyz, textOrg, fontFace, fontScale, cv::Scalar(48, 48, 255), thickness, 8);
 }
 
 int main(int argc, char** argv)

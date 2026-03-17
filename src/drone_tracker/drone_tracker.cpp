@@ -37,7 +37,7 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
     // static_transform.transform.rotation.w = -0.5;
     // static_tf_broadcaster_->sendTransform(static_transform);
 
-   vehicle_odometry_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>("/fmu/out/vehicle_odometry", qos, std::bind(&DroneTrackerController::odometry_callback, this, std::placeholders::_1));
+    vehicle_odometry_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>("/fmu/out/vehicle_odometry", qos, std::bind(&DroneTrackerController::odometry_callback, this, std::placeholders::_1));
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
     auto qos2 = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
     vehicle_control_mode_subscriber_ = this->create_subscription<VehicleControlMode>("/fmu/out/vehicle_control_mode", qos2,[this](const px4_msgs::msg::VehicleControlMode::UniquePtr msg) { c_mode = *msg; });
@@ -91,7 +91,7 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
     dob_y_ = std::make_unique<DisturbanceObserver>(2.0, ki_diag, 0.03); // Y轴观测器
     _last_cmd_accel = Eigen::Vector3d::Zero();
     _last_vehicle_velocity = Eigen::Vector3d::Zero();
-    _filtered_accel = Eigen::Vector3d::Zero();  // ✅ 新增：初始化滤波加速度
+    _filtered_accel = Eigen::Vector3d::Zero();  // 初始化滤波加速度
     _vehicle_mass = this->declare_parameter<double>("drone.mass", 2.0);
     _hover_thrust_norm = this->declare_parameter<double>("drone.hover_thrust_norm", 0.5);
     //_max_thrust_newton = _vehicle_mass * 9.81;
@@ -120,6 +120,24 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
 
 void DroneTrackerController::run_state_machine()
 {
+    // ==================== TEST MODE: 仅测试位姿解算，禁止飞控 ====================
+    // 说明：此时设置 ENABLE_FLIGHT_CONTROL 为 false 以禁止无人机飞起来
+    // 只运行位姿解算、卡尔曼滤波和数据发布，便于验证位姿准确性
+    
+    static constexpr bool ENABLE_FLIGHT_CONTROL = false;  // ← 改为 true 时启用飞控
+    
+    if (!ENABLE_FLIGHT_CONTROL) {
+        // 测试模式：只运行位姿解算和卡尔曼滤波，不做任何飞控
+        // 所有的 pose_callback() 中的位姿解算和卡尔曼滤波已经在后台自动运行
+        // 你可以通过 ROS 话题订阅以下消息来检查位姿准确性：
+        //   - /tracking/raw_pose          (原始QR码位姿)
+        //   - /tracking/filtered_pose     (卡尔曼滤波后的位姿)
+        //   - /tracking/estimated_velocity (估计的速度)
+        //   - /fmu/out/vehicle_odometry   (无人机的位姿)
+        return;
+    }
+    
+    // ==================== 实际飞控模式 ====================
     // 持续发布 OffboardControlMode 信号，这是PX4的要求
     publish_offboard_control_mode();
 
@@ -214,6 +232,12 @@ void DroneTrackerController::run_holding_state()
     if (t >= hold_duration_sec_) {
         switchToState(State::TRACKING);
     }
+    // RCLCPP_INFO(this->get_logger(),
+    // "State: HOLDING, now_z=%.3f target_z=%.3f e_z=%.3f vz_sp=%.3f",
+    // _vehicle_position_ned.z(),
+    // hold_pos_ned_.z(),
+    // e.z(),
+    // v_sp.z());
 }
 
 void DroneTrackerController::run_tracking_state()
@@ -223,7 +247,6 @@ void DroneTrackerController::run_tracking_state()
     // publish_trajectory_setpoint(_tag.position.x(), _tag.position.y(), HEIGHT);
     // RCLCPP_INFO(this->get_logger(), "TRACKING: Following tag at [%.2f, %.2f, %.2f]",
     //             _tag.position.x(), _tag.position.y(), HEIGHT); 
-    // ✅ 关键修复：使用卡尔曼滤波估计的速度进行前向预测
     const double tag_timeout_s = 2.0;
     const bool tag_recent = ((this->now() - _last_tag_seen_time).seconds() <= tag_timeout_s);
     if (!kf_filter_->isInitialized()) {
@@ -253,7 +276,6 @@ void DroneTrackerController::run_tracking_state()
     //     filtered_state.pose.pose.position.z
     // );
     
-    // ✅ 关键修复：第一次运行时，初始化 _last_filtered_position 并返回
     // rclcpp::Time current_time = this->now();
     // double dt_since_last = (current_time - _last_filter_time).seconds();
     
@@ -270,12 +292,11 @@ void DroneTrackerController::run_tracking_state()
 
 
 
-    // ✅ 先计算加速度大小（用于后续自适应）
     // 需要在使用前定义
     //double dt_control = 0.03; // 控制周期 (30ms)
     //Eigen::Vector3d current_accel = _vehicle_accel_ned;
 
-    // ✅ 改进：使用低通滤波后的加速度，减少噪声导致的 DOB 过度响应
+    // 改进：使用低通滤波后的加速度，减少噪声导致的 DOB 过度响应
     //Eigen::Vector3d current_accel = getFilteredAcceleration(current_accel_raw);
     
     // 计算加速度大小（用于后续自适应）
@@ -289,7 +310,7 @@ void DroneTrackerController::run_tracking_state()
         // 清零 Z 方向速度（小车在地面，Z不动）
         velocity_estimate.z() = 0.0;
 
-        // ✅ 改进：根据加速度大小自动调整预测地平线
+        // 改进：根据加速度大小自动调整预测地平线
         // 原理：小车加速时，用旧速度预测会过度前推，导致目标位置突跳
         // 解决：加速度大时，缩小预测地平线
         double adaptive_horizon = _prediction_horizon;
@@ -314,14 +335,14 @@ void DroneTrackerController::run_tracking_state()
                     kf_velocity.x() * _prediction_horizon,
                     kf_velocity.y() * _prediction_horizon);
 
-        // ✅ 发布估计的速度（用于 PlotJuggler）
+        // 发布估计的速度（用于 PlotJuggler）
         geometry_msgs::msg::Twist vel_msg;
         vel_msg.linear.x = velocity_estimate.x();
         vel_msg.linear.y = velocity_estimate.y();
         vel_msg.linear.z = 0.0;
         pj_est_velocity_pub_->publish(vel_msg);
     }
-    // ✅ 重要：更新上一次滤波位置和时间（必须在速度计算和使用之后）
+    //更新上一次滤波位置和时间（必须在速度计算和使用之后）
     _last_filtered_position = current_filtered_position;
     _last_filter_time = current_time;*/
     
@@ -343,7 +364,7 @@ void DroneTrackerController::run_tracking_state()
     // 简单的 PD 控制器生成期望加速度
    // Eigen::Vector3d cmd_accel_nominal = _kp * pos_error + _kd * vel_error + target_acc;
 
-    // ✅ 更新速度（用于下次加速度计算）
+    // 更新速度（用于下次加速度计算）
   //  _last_vehicle_velocity = _vehicle_velocity_ned;
 
 
@@ -403,12 +424,12 @@ void DroneTrackerController::run_tracking_state()
     // --- 正确调用 DOB 更新 (对应论文公式 15) ---
     // DOB 观测器需要：当前加速度、旋转矩阵、推力
     dob_->update(current_accel, R_body_to_earth, u_f);
-    Eigen::Vector3d fe_hat = dob_->getDisturbanceForce();   // N
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 50,
-        "[DOB] fe_hat[N] = [%.2f, %.2f, %.2f], u_f=%.2f N, accel=[%.2f, %.2f, %.2f]",
-        fe_hat.x(), fe_hat.y(), fe_hat.z(),
-        u_f,
-        current_accel.x(), current_accel.y(), current_accel.z());
+    // Eigen::Vector3d fe_hat = dob_->getDisturbanceForce();   // N
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 50,
+    //     "[DOB] fe_hat[N] = [%.2f, %.2f, %.2f], u_f=%.2f N, accel=[%.2f, %.2f, %.2f]",
+    //     fe_hat.x(), fe_hat.y(), fe_hat.z(),
+    //     u_f,
+    //     current_accel.x(), current_accel.y(), current_accel.z());
     // 获取估计的干扰力，换算成补偿加速度
     Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
     Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
@@ -428,7 +449,7 @@ void DroneTrackerController::run_tracking_state()
                          target_pos.x(), target_pos.y(),
                          v_cmd.x(), v_cmd.y(), v_cmd.z(),
                          a_ff.x(), a_ff.y());
-    // ✅ 改进：在加速阶段减弱 DOB 补偿
+    //改进：在加速阶段减弱 DOB 补偿
     // 原理：小车加速产生的加速度是真实物理事件，不是风扰
     // 过度补偿会导致超调。所以加速度大时，减弱补偿
     //Eigen::Vector3d disturbance = disturbance_accel;
@@ -472,7 +493,7 @@ void DroneTrackerController::run_tracking_state()
     //             "Accel_Mag: %.3f, CmdAcc: [%.3f, %.3f] m/s², PosErr: [%.3f, %.3f] m",
     //             disturbance_force.x(), disturbance_force.y(),
     //             disturbance_accel.x(), disturbance_accel.y(),
-    //             accel_magnitude,  // ✅ 新增
+    //             accel_magnitude,  // 新增
     //             cmd_accel_final.x(), cmd_accel_final.y(),
     //             pos_error.x(), pos_error.y());
 
@@ -507,19 +528,41 @@ bool DroneTrackerController::has_landed() const
 
 void DroneTrackerController::run_descend_state()
 {
+    /*------------------------------ 精准降落控制 ------------------------------*/
     publish_offboard_control_mode();
     // // 发布锁定的降落位置作为设定点，逐渐降低高度
     // float descend_z = std::max(_last_seen_tag.position.z() - 0.1f, 0.0f); // 每次降低0.1米，最低到地面
-    publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
+    //publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
     // publish_trajectory_setpoint(_last_seen_tag.position.x(), _last_seen_tag.position.y(), descend_z);
     // RCLCPP_INFO(this->get_logger(), "DESCEND: Descending to [%.2f, %.2f, %.2f]",
     //             _last_seen_tag.position.x(), _last_seen_tag.position.y(), );
-
-    // 检查是否已经降落
-    if (has_landed()) {
-        RCLCPP_INFO(this->get_logger(), "Landed successfully.");
-        //switchToState(State::FINISHED);
+    auto filtered_state = kf_filter_->getFilteredState();
+    target_pos = Eigen::Vector3d(filtered_state.pose.pose.position.x,
+                                    filtered_state.pose.pose.position.y,
+                                    filtered_state.pose.pose.position.z);
+    Eigen::Vector3d pos_error = target_pos - _vehicle_position_ned;
+    //pos_error.z() -= 0.3;
+    Eigen::Vector3d descend_vel = _descend_kp * pos_error;
+    //速度限幅
+    const double vxy_max = 1.0;
+    const double vz_max  = 0.5;
+    descend_vel.x() = std::clamp(descend_vel.x(), -vxy_max, vxy_max);
+    descend_vel.y() = std::clamp(descend_vel.y(), -vxy_max, vxy_max);
+    descend_vel.z() = std::clamp(descend_vel.z(), -vz_max,  vz_max);
+    publish_full_trajectory_setpoint(static_cast<float>(descend_vel.x()),
+                                     static_cast<float>(descend_vel.y()),
+                                     static_cast<float>(descend_vel.z()),
+                                     0.0f, 0.0f, 0.0f);
+    if (std::abs(pos_error.z()) < 0.3) {
+        RCLCPP_INFO(this->get_logger(), "Close to ground, sending LAND command.");
+        publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
     }
+//     // 检查是否已经降落
+//     if (has_landed()) {
+//         RCLCPP_INFO(this->get_logger(), "Landed successfully.");
+//         //switchToState(State::FINISHED);
+//     }
+// }
 }
 
 void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg){
@@ -573,7 +616,7 @@ void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped
     raw_msg.header = initial_msg->header;
     raw_msg.pose = initial_msg->pose;
     pj_raw_pose_pub_->publish(raw_msg);
-    // // ✅ 添加延迟诊断信息
+    // //添加延迟诊断信息
     // rclcpp::Time current_time = this->now();
     // double measurement_delay = (current_time - msg->header.stamp).seconds();
     // if (measurement_delay > 0.01)  // 延迟 > 10ms 时输出
@@ -619,7 +662,7 @@ void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped
         "Transform from ned to april tag(filtered):");
     // RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
     //             _tag.position.x(),
-    //             _tag.position.y(),
+    //             _tag.position.y(),W
     //             _tag.position.z());
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
         "Translation: x=%.2f, y=%.2f, z=%.2f",
@@ -630,8 +673,8 @@ void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped
 }
 DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const ArucoTag& tag_camera) {
     Eigen::Matrix3d R;
-    R << 0, -1, 0,
-        1, 0, 0,
+    R << 0, 1, 0,
+        -1, 0, 0,
         0, 0, 1;
     Eigen::Quaterniond quat_NED(R);
 
@@ -639,11 +682,11 @@ DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const Aruco
     // rclcpp::Time meas_time = tag_camera.timestamp;
     // rclcpp::Time current_time = this->now();
     // double time_diff = (current_time - meas_time).seconds();
-
+    
     auto vehicle_position = Eigen::Vector3d(_vehicle_position_ned.cast<double>());
     auto vehicle_orientation = Eigen::Quaterniond(_vehicle_orientation.cast<double>());
     Eigen::Affine3d drone_transform = Eigen::Translation3d(vehicle_position) * vehicle_orientation;
-    Eigen::Affine3d camera_transform = Eigen::Translation3d(0,0,0) * quat_NED;
+    Eigen::Affine3d camera_transform = Eigen::Translation3d(0.106, 0.0, 0.158) * quat_NED;
     Eigen::Affine3d tag_transform = Eigen::Translation3d(tag_camera.position) * tag_camera.orientation;
     Eigen::Affine3d tag_transform_world = drone_transform * camera_transform * tag_transform;
 
@@ -849,18 +892,18 @@ std::string DroneTrackerController::getStateName(State state)
     }
 }
 
-// ✅ 新增：加速度低通滤波方法
-Eigen::Vector3d DroneTrackerController::getFilteredAcceleration(const Eigen::Vector3d& raw_accel)
-{
-    // 一阶低通滤波器
-    // f(k) = α·x(k) + (1-α)·f(k-1)
-    // α 越小，滤波越强（但延迟越大）
-    // α = 0.3 是一个好的平衡点
-    _filtered_accel = _accel_filter_alpha * raw_accel + 
-                      (1.0 - _accel_filter_alpha) * _filtered_accel;
+//加速度低通滤波方法
+// Eigen::Vector3d DroneTrackerController::getFilteredAcceleration(const Eigen::Vector3d& raw_accel)
+// {
+//     // 一阶低通滤波器
+//     // f(k) = α·x(k) + (1-α)·f(k-1)
+//     // α 越小，滤波越强（但延迟越大）
+//     // α = 0.3 是一个好的平衡点
+//     _filtered_accel = _accel_filter_alpha * raw_accel + 
+//                       (1.0 - _accel_filter_alpha) * _filtered_accel;
     
-    return _filtered_accel;
-}
+//     return _filtered_accel;
+// }
 
 void DroneTrackerController::switchToState(State state)
 {

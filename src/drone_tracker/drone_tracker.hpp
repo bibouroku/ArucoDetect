@@ -16,7 +16,7 @@
 
 #define X_DIST 0.0
 #define Y_DIST 0.0
-#define HEIGHT -2.5
+#define HEIGHT -1.5
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
@@ -42,6 +42,8 @@ using namespace px4_msgs::msg;
 #include <memory> // 为了 std::unique_ptr
 
 #include <Eigen/Dense>
+#include <fstream>
+#include <iomanip>
 
 using namespace std::chrono_literals;
 
@@ -237,10 +239,14 @@ private:
     // --- PD 控制器参数 ---
     double _kp = 1.0;                           // 位置增益
     double _kd = 2.0;                           // 速度增益
+    // --- PID降落控制参数 ---
+    double _descend_kp = 0.8;                  // 降落位置
+    double _descend_kd = 1.0;                  // 降落速度
+    double _descend_ki = 0.0;                  // 降落积分
     
     // --- 控制指令缓存（用于反推推力）---
     double _current_normalized_thrust = 0.5;    // 当前标准化推力 (0-1)
-
+    
 
     
     
@@ -248,8 +254,5 @@ private:
     // 加速度滤波
     Eigen::Vector3d _filtered_accel = Eigen::Vector3d::Zero();           // 滤波后的加速度
     double _accel_filter_alpha = 0.3;          // 低通滤波系数 (0.1-0.5)
-    
-    // 方法声明
-    Eigen::Vector3d getFilteredAcceleration(const Eigen::Vector3d& raw_accel);
 };
 
