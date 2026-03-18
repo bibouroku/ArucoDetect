@@ -226,7 +226,7 @@ void DroneTrackerController::run_holding_state()
     // dob_->update(_vehicle_accel_ned, R_body_to_earth, thrust_newton);
     // a_ff = - dob_->getDisturbanceAcceleration();   // 注意符号：补偿用负号
 
-    publish_full_trajectory_setpoint(v_sp.x(), v_sp.y(), v_sp.z(),
+    publish_full_trajectory_setpoint(0, 0, v_sp.z(),
                                a_ff.x(), a_ff.y(), a_ff.z());
     const double t = (this->now() - hold_start_time_).seconds();
     if (t >= hold_duration_sec_) {
@@ -492,7 +492,7 @@ void DroneTrackerController::run_tracking_state()
     // RCLCPP_INFO(this->get_logger(), 
     //             "[DOB INFO] Wind_Est: [%.3f, %.3f] N, Accel_Est: [%.3f, %.3f] m/s², "
     //             "Accel_Mag: %.3f, CmdAcc: [%.3f, %.3f] m/s², PosErr: [%.3f, %.3f] m",
-    //             disturbance_force.x(), disturbance_force.y(),
+    //             disturbance_force.x(), disturbance_force.y(),f
     //             disturbance_accel.x(), disturbance_accel.y(),
     //             accel_magnitude,  // 新增
     //             cmd_accel_final.x(), cmd_accel_final.y(),
