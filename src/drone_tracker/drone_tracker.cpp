@@ -202,7 +202,7 @@ void DroneTrackerController::run_holding_state()
         hold_int_err_.setZero();
     }
     const double dt = 0.03; // 你的 timer 周期；如果你有更真实dt可替换
-
+ 
     // 位置误差
     Eigen::Vector3d e = hold_pos_ned_ - _vehicle_position_ned;
 
@@ -406,13 +406,13 @@ void DroneTrackerController::run_tracking_state()
     v_cmd.z() = std::clamp(v_cmd.z(), -vz_max,  vz_max);
 
     // 4) DOB：估计外扰并作为加速度前馈补偿（只补偿 XY）
-    Eigen::Vector3d current_accel = _vehicle_accel_ned;
+    // Eigen::Vector3d current_accel = _vehicle_accel_ned;
     // 2. 获取当前旋转矩阵 R (将四元数转为 Eigen::Matrix3d)
-    Eigen::Matrix3d R_body_to_earth = _vehicle_orientation.toRotationMatrix();
+    // Eigen::Matrix3d R_body_to_earth = _vehicle_orientation.toRotationMatrix();
 
     // 2) 推力幅值 u_f（如果没有真实反馈，先用 hover 近似 + 简单修正）
     // 最保守：直接用悬停推力（适合你“只想估风力”且机动不大）：
-    double u_f = _hover_thrust_norm * _max_thrust_newton;
+    // double u_f = _hover_thrust_norm * _max_thrust_newton;
 
     // 3. 获取当前总推力 (单位：牛顿)
     // 推力 = 标准化推力 × 最大推力
@@ -423,7 +423,7 @@ void DroneTrackerController::run_tracking_state()
 
     // --- 正确调用 DOB 更新 (对应论文公式 15) ---
     // DOB 观测器需要：当前加速度、旋转矩阵、推力
-    dob_->update(current_accel, R_body_to_earth, u_f);
+    // dob_->update(current_accel, R_body_to_earth, u_f);
     // Eigen::Vector3d fe_hat = dob_->getDisturbanceForce();   // N
     // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 50,
     //     "[DOB] fe_hat[N] = [%.2f, %.2f, %.2f], u_f=%.2f N, accel=[%.2f, %.2f, %.2f]",
@@ -431,12 +431,13 @@ void DroneTrackerController::run_tracking_state()
     //     u_f,
     //     current_accel.x(), current_accel.y(), current_accel.z());
     // 获取估计的干扰力，换算成补偿加速度
-    Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
-    Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
+    // Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
+    // Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
 
 
     // 注意符号：补偿时取负号；只补偿 XY，Z=0
-    Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
+    // Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
+    Eigen::Vector3d a_ff = Eigen::Vector3d::Zero(); // 目前不使用 DOB 补偿，保持加速度前馈为0
     // 5) 发送速度 + 加速度（position 全 NaN，由 publish_full_trajectory_setpoint 保证）
     publish_full_trajectory_setpoint(static_cast<float>(v_cmd.x()),
                                      static_cast<float>(v_cmd.y()),
