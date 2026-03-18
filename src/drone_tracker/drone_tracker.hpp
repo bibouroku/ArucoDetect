@@ -178,8 +178,8 @@ private:
     double hold_duration_sec_ = 4.5;
     bool hold_inited_ = false;
     rclcpp::Time hold_start_time_;
-    double hold_kp_ = 1.0;
-    double hold_ki_ = 0.0;
+    Eigen::Vector3d hold_kp_ = Eigen::Vector3d(0.8, 0.8, 1.0); // HOLD 状态的 P 增益，Z 轴可以适当大一些
+    Eigen::Vector3d hold_ki_ = Eigen::Vector3d(0.0, 0.0, 0.05); // HOLD 状态的 I 增益，初始为0，后续可调试开启
     Eigen::Vector3d hold_pos_ned_;
     Eigen::Vector3d hold_int_err_ = Eigen::Vector3d::Zero();  // 可选：PI
     bool offboard_and_arm_sent_ = false; // 记录是否已经发送过切换到 Offboard 模式和解锁的命令

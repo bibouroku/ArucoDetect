@@ -202,23 +202,58 @@ void DroneTrackerController::run_holding_state()
         hold_int_err_.setZero();
     }
     const double dt = 0.03; // 你的 timer 周期；如果你有更真实dt可替换
- 
+    const double t = (this->now() - hold_start_time_).seconds();
     // 位置误差
     Eigen::Vector3d e = hold_pos_ned_ - _vehicle_position_ned;
+    const double z_enable_xy_threshold = 0.20; // 高度控制启用的水平误差阈值;
+    const double min_z_only_time = 1.0; // 最小只控制高度的时间，避免一开始就因为位置误差大而无法稳定高度
+    const bool xy_enabled = (std::abs(e.z()) < z_enable_xy_threshold) && (t > min_z_only_time);
 
+    //z方向上始终进行PI控制
+    hold_int_err_.z() += e.z() * dt;
+    hold_int_err_.z() = std::clamp(hold_int_err_.z(), -2.0, 2.0); // Z轴积分限幅，防止过
+    double vz_sp = hold_kp_.z() * e.z() + hold_ki_.z() * hold_int_err_.z();
+    vz_sp = std::clamp(vz_sp, -0.8, 0.8); // Z轴速度限幅
+
+    //--xy方向上先不控制
+    double vx_sp = 0.0;
+    double vy_sp = 0.0;
+
+    if (xy_enabled){
+        //加入死区，减少噪声等误差影响
+        if(std::abs(e.x()) < 0.05) e.x() = 0.0; // 位置误差小于5cm时认为是0
+        if(std::abs(e.y()) < 0.05) e.y() = 0.0; // 位置误差小于5cm时认为是0
+        // 水平位置误差较小且已经稳定一段时间了，可以开启XY控制
+        hold_int_err_.x() += e.x() * dt;
+        hold_int_err_.y() += e.y() * dt;
+        // 可选：XY积分限幅，防止过积分
+        hold_int_err_.x() = std::clamp(hold_int_err_.x(), -1.0, 1.0);
+        hold_int_err_.y() = std::clamp(hold_int_err_.y(), -1.0, 1.0);
+
+        vx_sp = hold_kp_.x() * e.x() + hold_ki_.x() * hold_int_err_.x();
+        vy_sp = hold_kp_.y() * e.y() + hold_ki_.y() * hold_int_err_.y();
+
+        // XY速度限幅
+        vx_sp = std::clamp(vx_sp, -0.3, 0.3);
+        vy_sp = std::clamp(vy_sp, -0.3, 0.3);
+    }else{
+        // 水平位置误差较大，先只控制高度，XY速度设为0
+        hold_int_err_.x() = 0.0; // 不积累XY误差
+        hold_int_err_.y() = 0.0;
+    }
     // 可选 PI：积分抗风漂
-    hold_int_err_ += e * dt;
+    //hold_int_err_ += e * dt;
     // 防 windup
-    hold_int_err_.x() = std::clamp(hold_int_err_.x(), -2.0, 2.0);
-    hold_int_err_.y() = std::clamp(hold_int_err_.y(), -2.0, 2.0);
-    hold_int_err_.z() = std::clamp(hold_int_err_.z(), -2.0, 2.0);
+    // hold_int_err_.x() = std::clamp(hold_int_err_.x(), -2.0, 2.0);
+    // hold_int_err_.y() = std::clamp(hold_int_err_.y(), -2.0, 2.0);
+    // hold_int_err_.z() = std::clamp(hold_int_err_.z(), -2.0, 2.0);
 
-    Eigen::Vector3d v_sp = hold_kp_ * e + hold_ki_ * hold_int_err_;
+    // Eigen::Vector3d v_sp = hold_kp_ * e + hold_ki_ * hold_int_err_;
 
     // 限幅（先保守）
-    v_sp.x() = std::clamp(v_sp.x(), -2.0, 2.0);
-    v_sp.y() = std::clamp(v_sp.y(), -2.0, 2.0);
-    v_sp.z() = std::clamp(v_sp.z(), -1.0, 1.0);
+    // v_sp.x() = std::clamp(v_sp.x(), -2.0, 2.0);
+    // v_sp.y() = std::clamp(v_sp.y(), -2.0, 2.0);
+    // v_sp.z() = std::clamp(v_sp.z(), -1.0, 1.0);
 
     // DOB 前馈（只做补偿，不做闭环）
     Eigen::Vector3d a_ff = Eigen::Vector3d::Zero();
@@ -226,9 +261,9 @@ void DroneTrackerController::run_holding_state()
     // dob_->update(_vehicle_accel_ned, R_body_to_earth, thrust_newton);
     // a_ff = - dob_->getDisturbanceAcceleration();   // 注意符号：补偿用负号
 
-    publish_full_trajectory_setpoint(0, 0, v_sp.z(),
+    publish_full_trajectory_setpoint(vx_sp, vy_sp, vz_sp,
                                a_ff.x(), a_ff.y(), a_ff.z());
-    const double t = (this->now() - hold_start_time_).seconds();
+
     if (t >= hold_duration_sec_) {
         switchToState(State::TRACKING);
     }
