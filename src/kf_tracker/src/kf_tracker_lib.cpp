@@ -315,7 +315,7 @@ KFTrackerCore::KFTrackerCore(rclcpp::Logger logger, double q_std, double r_std, 
   dt_pred_(dt_pred),
   is_state_initialized_(false),
   state_buffer_size_(40),
-  debug_(true)  // 启用调试模式以便诊断问题
+  debug_(false)  // 启用调试模式以便诊断问题
 {
     initKF();
     RCLCPP_INFO(logger_, "KFTrackerCore instance created with dt_pred=%.4f, q=%.4f, r=%.4f", dt_pred_, q_, r_);

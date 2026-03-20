@@ -16,7 +16,7 @@
 
 #define X_DIST 0.0
 #define Y_DIST 0.0
-#define HEIGHT -1.5
+#define HEIGHT -3
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
@@ -199,6 +199,8 @@ private:
     rclcpp::Time _last_filter_time;                    // 上一次滤波时间
     double _prediction_horizon = 0.1;                  // 前向预测时间（秒）
 
+    void print_debug_panel();
+    const char* state_to_string(State state) const;
 
     
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;

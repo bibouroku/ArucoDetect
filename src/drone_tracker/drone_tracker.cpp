@@ -111,11 +111,39 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
             // 注意：PX4 的 VLP 消息中 ax, ay, az 定义为 "Acceleration in NED frame"
             // 且通常已经去除了重力
             _vehicle_accel_ned = Eigen::Vector3d(msg->ax, msg->ay, msg->az);
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200, "Received VehicleLocalPosition !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200, "Received VehicleLocalPosition !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
             // 如果你仍然觉得有噪声，可以在这里加个轻微的低通滤波，但通常不需要
             // _vehicle_accel_ned = getFilteredAcceleration(_vehicle_accel_ned);
         });
     timer_ = this->create_wall_timer(30ms, std::bind(&DroneTrackerController::run_state_machine, this));
+}
+
+void DroneTrackerController::print_debug_panel()
+{
+    static bool first_print = true;
+    geometry_msgs::msg::PoseWithCovarianceStamped pos = filtered_pose;
+    Eigen::Vector3d vel = _vehicle_velocity_ned;
+    const char* state_str = state_to_string(current_state);
+    if (!first_print)
+    {
+        // 回到前6行，覆盖之前的输出
+        std::cout << "\033[6A"; // ANSI 转义序列：光标上移6行
+    }
+    std::cout << "\033[2J\033[H";
+    std::cout
+    << "===========================================Debug Panel===========================================\n"
+    << "State: " << state_str << "\n"
+    << "Position [m]:  "
+    << "x=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.x 
+    << "  y=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.y
+    << "  z=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.z << "\n"
+    << "Velocity [m/s]: "
+    << "vx=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.x() 
+    << "  vy=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.y()
+    << "  vz=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.z() << "\n"
+    << std::flush;
+
+    first_print = false;
 }
 
 void DroneTrackerController::run_state_machine()
@@ -124,7 +152,7 @@ void DroneTrackerController::run_state_machine()
     // 说明：此时设置 ENABLE_FLIGHT_CONTROL 为 false 以禁止无人机飞起来
     // 只运行位姿解算、卡尔曼滤波和数据发布，便于验证位姿准确性
     
-    static constexpr bool ENABLE_FLIGHT_CONTROL = false;  // ← 改为 true 时启用飞控
+    static constexpr bool ENABLE_FLIGHT_CONTROL = true;  // ← 改为 true 时启用飞控
     
     if (!ENABLE_FLIGHT_CONTROL) {
         // 测试模式：只运行位姿解算和卡尔曼滤波，不做任何飞控
@@ -162,12 +190,13 @@ void DroneTrackerController::run_state_machine()
         //     run_landed_state();
         //     break;
     }
+    print_debug_panel();
 }
 
 
 void DroneTrackerController::run_idle_state()
 {
-    RCLCPP_INFO(this->get_logger(), "State: IDLE");
+    // RCLCPP_INFO(this->get_logger(), "State: IDLE");
     switchToState(State::ARMING);
 }
 
@@ -192,10 +221,10 @@ void DroneTrackerController::run_arming_state()
 void DroneTrackerController::run_holding_state()
 {
     publish_offboard_control_mode();
-    RCLCPP_INFO(this->get_logger(), "State: HOLDING");
+    // RCLCPP_INFO(this->get_logger(), "State: HOLDING");
 
     if (!odom_received_ || odom_count_ < 20){
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for odometry data... Received %d messages", odom_count_);
+        // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for odometry data... Received %d messages", odom_count_);
         publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
         return;
     }
@@ -511,11 +540,11 @@ void DroneTrackerController::run_tracking_state()
                                      static_cast<float>(a_ff.x()),
                                      static_cast<float>(a_ff.y()),
                                      static_cast<float>(a_ff.z()));
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-                         "TRACKING: target_xy=[%.3f, %.3f], v_cmd=[%.3f, %.3f, %.3f], a_ff=[%.3f, %.3f]",
-                         target_pos.x(), target_pos.y(),
-                         v_cmd.x(), v_cmd.y(), v_cmd.z(),
-                         a_ff.x(), a_ff.y());
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+    //                      "TRACKING: target_xy=[%.3f, %.3f], v_cmd=[%.3f, %.3f, %.3f], a_ff=[%.3f, %.3f]",
+    //                      target_pos.x(), target_pos.y(),
+    //                      v_cmd.x(), v_cmd.y(), v_cmd.z(),
+    //                      a_ff.x(), a_ff.y());
     //改进：在加速阶段减弱 DOB 补偿
     // 原理：小车加速产生的加速度是真实物理事件，不是风扰
     // 过度补偿会导致超调。所以加速度大时，减弱补偿
@@ -621,7 +650,7 @@ void DroneTrackerController::run_descend_state()
                                      static_cast<float>(descend_vel.z()),
                                      0.0f, 0.0f, 0.0f);
     if (std::abs(pos_error.z()) < 0.3) {
-        RCLCPP_INFO(this->get_logger(), "Close to ground, sending LAND command.");
+        // RCLCPP_INFO(this->get_logger(), "Close to ground, sending LAND command.");
         publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
     }
 //     // 检查是否已经降落
@@ -725,23 +754,23 @@ void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped
             _last_stable_tag_position = _tag;
         }
     }
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-        "Transform from ned to april tag(filtered):");
-    // RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
-    //             _tag.position.x(),
-    //             _tag.position.y(),W
-    //             _tag.position.z());
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-        "Translation: x=%.2f, y=%.2f, z=%.2f",
-        filtered_pose.pose.pose.position.x,
-        filtered_pose.pose.pose.position.y,
-        filtered_pose.pose.pose.position.z);
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+    //     "Transform from ned to april tag(filtered):");
+    // // RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
+    // //             _tag.position.x(),
+    // //             _tag.position.y(),W
+    // //             _tag.position.z());
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+    //     "Translation: x=%.2f, y=%.2f, z=%.2f",
+    //     filtered_pose.pose.pose.position.x,
+    //     filtered_pose.pose.pose.position.y,
+    //     filtered_pose.pose.pose.position.z);
 
 }
 DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const ArucoTag& tag_camera) {
     Eigen::Matrix3d R;
-    R << 0, 1, 0,
-        -1, 0, 0,
+    R << 0, -1, 0,
+        1, 0, 0,
         0, 0, 1;
     Eigen::Quaterniond quat_NED(R);
 
@@ -753,7 +782,7 @@ DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const Aruco
     auto vehicle_position = Eigen::Vector3d(_vehicle_position_ned.cast<double>());
     auto vehicle_orientation = Eigen::Quaterniond(_vehicle_orientation.cast<double>());
     Eigen::Affine3d drone_transform = Eigen::Translation3d(vehicle_position) * vehicle_orientation;
-    Eigen::Affine3d camera_transform = Eigen::Translation3d(0.106, 0.0, 0.158) * quat_NED;
+    Eigen::Affine3d camera_transform = Eigen::Translation3d(0.0, 0.0, 0.0) * quat_NED;
     Eigen::Affine3d tag_transform = Eigen::Translation3d(tag_camera.position) * tag_camera.orientation;
     Eigen::Affine3d tag_transform_world = drone_transform * camera_transform * tag_transform;
 
@@ -810,11 +839,11 @@ void DroneTrackerController::lookup_transform(){
     try{
         transformStamped = tf_buffer_->lookupTransform(target_frame, source_frame,
                              tf2::TimePointZero);
-        RCLCPP_INFO(this->get_logger(), "Transform from map to april tag:");
-        RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
-                    transformStamped.transform.translation.x,
-                    transformStamped.transform.translation.y,
-                    transformStamped.transform.translation.z);
+        // RCLCPP_INFO(this->get_logger(), "Transform from map to april tag:");
+        // RCLCPP_INFO(this->get_logger(), "Translation: x=%.2f, y=%.2f, z=%.2f",
+        //             transformStamped.transform.translation.x,
+        //             transformStamped.transform.translation.y,
+        //             transformStamped.transform.translation.z);
         aruco_x = transformStamped.transform.translation.x;
         aruco_y = transformStamped.transform.translation.y;
         aruco_z = transformStamped.transform.translation.z;
@@ -900,9 +929,9 @@ void DroneTrackerController::publish_trajectory_setpoint(float x, float y, float
     msg.position = {static_cast<float>(x), static_cast<float>(y), z};
     msg.yaw = std::numeric_limits<float>::quiet_NaN();
     trajectory_setpoint_publisher_->publish(msg);
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-                "Published TrajectorySetpoint: [%.2f, %.2f, %.2f]",
-                msg.position[0], msg.position[1], msg.position[2]);
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+    //             "Published TrajectorySetpoint: [%.2f, %.2f, %.2f]",
+    //             msg.position[0], msg.position[1], msg.position[2]);
 }
 
 void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy, float vz,
@@ -924,9 +953,9 @@ void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy
 
     trajectory_setpoint_publisher_->publish(msg);
 
-    RCLCPP_INFO_THROTTLE(this->get_logger(),*this->get_clock(), 200,
-                "Published TrajectorySetpoint - Vel:[%.3f, %.3f, %.3f], Accel:[%.3f, %.3f, %.3f]",
-                 vx, vy, vz, ax, ay, az);
+    // RCLCPP_INFO_THROTTLE(this->get_logger(),*this->get_clock(), 200,
+    //             "Published TrajectorySetpoint - Vel:[%.3f, %.3f, %.3f], Accel:[%.3f, %.3f, %.3f]",
+    //              vx, vy, vz, ax, ay, az);
 }
 
 void DroneTrackerController::publish_vehicle_command(uint16_t command, float param1, float param2)
@@ -977,14 +1006,31 @@ std::string DroneTrackerController::getStateName(State state)
 
 void DroneTrackerController::switchToState(State state)
 {
-    RCLCPP_INFO(this->get_logger(), "Switching state from %s to %s",
-                getStateName(current_state).c_str(),
-                getStateName(state).c_str());
+    // RCLCPP_INFO(this->get_logger(), "Switching state from %s to %s",
+    //             getStateName(current_state).c_str(),
+    //             getStateName(state).c_str());
     current_state = state;
     if(state == State::HOLDING){
         hold_inited_ = false;
         hold_wait_stable_ = true;
         hold_stable_count_ = 0;
+    }
+}
+
+const char* DroneTrackerController::state_to_string(State state) const {
+    switch (state) {
+        case State::IDLE:
+            return "IDLE";
+        case State::ARMING:
+            return "ARMING";
+        case State::HOLDING:
+            return "HOLDING";
+        case State::TRACKING:
+            return "TRACKING";
+        case State::DESCEND:
+            return "DESCEND";
+        default:
+            return "UNKNOWN";
     }
 }
 
