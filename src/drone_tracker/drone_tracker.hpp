@@ -181,7 +181,13 @@ private:
     Eigen::Vector3d hold_kp_ = Eigen::Vector3d(0.8, 0.8, 1.0); // HOLD 状态的 P 增益，Z 轴可以适当大一些
     Eigen::Vector3d hold_ki_ = Eigen::Vector3d(0.0, 0.0, 0.05); // HOLD 状态的 I 增益，初始为0，后续可调试开启
     Eigen::Vector3d hold_pos_ned_;
-    Eigen::Vector3d hold_int_err_ = Eigen::Vector3d::Zero();  // 可选：PI
+    Eigen::Vector3d hold_int_err_ = Eigen::Vector3d::Zero();  // 可选：PI   
+    bool odom_received_ = false; // 标记是否已经收到过里程计数据
+    int odom_count_ = 0; // 里程计消息计数器
+    bool hold_wait_stable_ = false; // HOLD 状态是否等待位置稳定
+    int hold_stable_count_ = 0; // HOLD 状态位置稳定计数器
+    Eigen::Vector3d hold_last_pos_ned_{0.0, 0.0, 0.0}; // HOLD 状态上一次位置（用于判断稳定）
+
     bool offboard_and_arm_sent_ = false; // 记录是否已经发送过切换到 Offboard 模式和解锁的命令
     Eigen::Vector3d target_pos;
 
@@ -192,6 +198,8 @@ private:
     Eigen::Vector3d _last_filtered_position;           // 上一次滤波位置（用于速度计算）
     rclcpp::Time _last_filter_time;                    // 上一次滤波时间
     double _prediction_horizon = 0.1;                  // 前向预测时间（秒）
+
+
     
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::TimerBase::SharedPtr timer_;

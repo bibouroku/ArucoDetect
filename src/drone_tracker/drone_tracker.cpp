@@ -193,13 +193,44 @@ void DroneTrackerController::run_holding_state()
 {
     publish_offboard_control_mode();
     RCLCPP_INFO(this->get_logger(), "State: HOLDING");
+
+    if (!odom_received_ || odom_count_ < 20){
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for odometry data... Received %d messages", odom_count_);
+        publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
+        return;
+    }
+
     if (!hold_inited_) {
         hold_start_time_ = this->now();
         hold_inited_ = true;
 
-        hold_pos_ned_ = _vehicle_position_ned;
-        hold_pos_ned_.z() = HEIGHT;   // 你的 HEIGHT 是固定高度（NED）
+        hold_wait_stable_ = true;
+        hold_stable_count_ = 0;
+        // hold_pos_ned_ = _vehicle_position_ned;
+        hold_last_pos_ned_ = _vehicle_position_ned;
+        // hold_pos_ned_.z() = HEIGHT;   // 你的 HEIGHT 是固定高度（NED）
         hold_int_err_.setZero();
+        publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
+        return;
+    }
+    if (hold_wait_stable_){
+        Eigen::Vector3d delta = _vehicle_position_ned - hold_last_pos_ned_;
+        double pos_diff = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+        if (pos_diff < 0.02){
+            hold_stable_count_++;
+        }else{
+            hold_stable_count_ = 0;
+        }
+        hold_last_pos_ned_ = _vehicle_position_ned;
+        if (hold_stable_count_ >= 20){ // 连续20次（约600ms）位置稳定
+            hold_wait_stable_ = false;
+            hold_pos_ned_ = _vehicle_position_ned; // 以当前位置作为定点
+            hold_pos_ned_.z() = HEIGHT;
+            hold_int_err_.setZero();
+        }else{
+            publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
+            return;
+        }
     }
     const double dt = 0.03; // 你的 timer 周期；如果你有更真实dt可替换
     const double t = (this->now() - hold_start_time_).seconds();
@@ -817,6 +848,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
     _vehicle_velocity_ned = Eigen::Vector3d(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
     _last_odometry_stamp = this->now();
     
+    odom_received_ = true;
+    odom_count_++;
+
     base_x = msg->position[0];
     base_y = msg->position[1];
     base_z = msg->position[2];
@@ -947,6 +981,11 @@ void DroneTrackerController::switchToState(State state)
                 getStateName(current_state).c_str(),
                 getStateName(state).c_str());
     current_state = state;
+    if(state == State::HOLDING){
+        hold_inited_ = false;
+        hold_wait_stable_ = true;
+        hold_stable_count_ = 0;
+    }
 }
 
 int main(int argc, char *argv[])
