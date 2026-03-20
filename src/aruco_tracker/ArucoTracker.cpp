@@ -24,13 +24,13 @@ ArucoTrackerNode::ArucoTrackerNode()
 
 	// Subscribers
 	_image_sub = this->create_subscription<sensor_msgs::msg::Image>(
-			     "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image", 
-				//  "/camera1/image_raw",
+			    //  "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image", 
+				 "/camera1/image_raw",
 				 qos, std::bind(&ArucoTrackerNode::image_callback, this, std::placeholders::_1));
 
 	_camera_info_sub = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-				   "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info",
-				//    "/camera_info", 
+				//    "/world/aruco/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/camera_info",
+				   "/camera_info", 
 					qos, std::bind(&ArucoTrackerNode::camera_info_callback, this, std::placeholders::_1)); 	
 
 	// Publishers
@@ -46,8 +46,8 @@ void ArucoTrackerNode::loadParameters()
 {
 	declare_parameter<int>("aruco_id", 0);
 	declare_parameter<int>("dictionary", 2); // DICT_4X4_250
-	declare_parameter<double>("marker_size", 0.5);
-	// declare_parameter<double>("marker_size", 0.14); // 6.4cm
+	// declare_parameter<double>("marker_size", 0.5);
+	declare_parameter<double>("marker_size", 0.14); // 6.4cm
 
 	get_parameter("aruco_id", _param_aruco_id);
 	get_parameter("dictionary", _param_dictionary);
