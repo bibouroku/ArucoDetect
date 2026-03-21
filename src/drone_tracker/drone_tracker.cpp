@@ -950,7 +950,7 @@ void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy
 
     // yaw 不用：NaN
     msg.yaw = NaN;
-
+    msg.yawspeed = NaN;
     trajectory_setpoint_publisher_->publish(msg);
 
     // RCLCPP_INFO_THROTTLE(this->get_logger(),*this->get_clock(), 200,
