@@ -199,6 +199,9 @@ private:
     rclcpp::Time _last_filter_time;                    // 上一次滤波时间
     double _prediction_horizon = 0.1;                  // 前向预测时间（秒）
 
+    float current_yaw_ = 0.0f; // 当前无人机航向角（弧度）
+    float locked_yaw_ = 0.0f;
+
     void print_debug_panel();
     const char* state_to_string(State state) const;
 
@@ -218,7 +221,8 @@ private:
     void publish_offboard_control_mode();
     void publish_trajectory_setpoint(float x, float y, float z);
     void publish_full_trajectory_setpoint(float vx, float vy, float vz,
-                                          float ax, float ay, float az);
+                                          float ax, float ay, float az,
+                                          float yaw = std::numeric_limits<float>::quiet_NaN());
     void publish_transform();
     void lookup_transform();
     void odometry_callback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);

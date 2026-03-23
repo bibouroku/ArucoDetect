@@ -141,6 +141,8 @@ void DroneTrackerController::print_debug_panel()
     << "vx=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.x() 
     << "  vy=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.y()
     << "  vz=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.z() << "\n"
+    << "Current Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (current_yaw_ * 180.0 / M_PI) << "\n"
+    << "Locked Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (locked_yaw_ * 180.0 / M_PI) << "\n"
     << std::flush;
 
     first_print = false;
@@ -225,7 +227,7 @@ void DroneTrackerController::run_holding_state()
 
     if (!odom_received_ || odom_count_ < 20){
         // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for odometry data... Received %d messages", odom_count_);
-        publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
+        publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, current_yaw_); // 发布零速度和零加速度的设定点，保持当前位置
         return;
     }
 
@@ -239,7 +241,8 @@ void DroneTrackerController::run_holding_state()
         hold_last_pos_ned_ = _vehicle_position_ned;
         // hold_pos_ned_.z() = HEIGHT;   // 你的 HEIGHT 是固定高度（NED）
         hold_int_err_.setZero();
-        publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
+        locked_yaw_ = current_yaw_; // 锁定当前航向角
+        publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, locked_yaw_); // 发布零速度和零加速度的设定点，保持当前位置
         return;
     }
     if (hold_wait_stable_){
@@ -257,7 +260,7 @@ void DroneTrackerController::run_holding_state()
             hold_pos_ned_.z() = HEIGHT;
             hold_int_err_.setZero();
         }else{
-            publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); // 发布零速度和零加速度的设定点，保持当前位置
+            publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, locked_yaw_); // 发布零速度和零加速度的设定点，保持当前位置
             return;
         }
     }
@@ -322,7 +325,7 @@ void DroneTrackerController::run_holding_state()
     // a_ff = - dob_->getDisturbanceAcceleration();   // 注意符号：补偿用负号
 
     publish_full_trajectory_setpoint(vx_sp, vy_sp, vz_sp,
-                               a_ff.x(), a_ff.y(), a_ff.z());
+                               a_ff.x(), a_ff.y(), a_ff.z(), locked_yaw_);
 
     if (t >= hold_duration_sec_) {
         switchToState(State::TRACKING);
@@ -348,7 +351,7 @@ void DroneTrackerController::run_tracking_state()
         // 滤波器尚未初始化：先保持当前速度为 0，同时用 vz 纠正高度
         const double z_err = HEIGHT - _vehicle_position_ned.z();
         const double vz_cmd = std::clamp(_kp * z_err, -1.0, 1.0);
-        publish_full_trajectory_setpoint(0.0f, 0.0f, static_cast<float>(vz_cmd), 0.0f, 0.0f, 0.0f);
+        publish_full_trajectory_setpoint(0.0f, 0.0f, static_cast<float>(vz_cmd), 0.0f, 0.0f, 0.0f, locked_yaw_);
         return;
     }
     // 检查是否长时间没有看到二维码
@@ -539,7 +542,8 @@ void DroneTrackerController::run_tracking_state()
                                      static_cast<float>(v_cmd.z()),
                                      static_cast<float>(a_ff.x()),
                                      static_cast<float>(a_ff.y()),
-                                     static_cast<float>(a_ff.z()));
+                                     static_cast<float>(a_ff.z()), 
+                                     locked_yaw_);
     // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
     //                      "TRACKING: target_xy=[%.3f, %.3f], v_cmd=[%.3f, %.3f, %.3f], a_ff=[%.3f, %.3f]",
     //                      target_pos.x(), target_pos.y(),
@@ -648,7 +652,7 @@ void DroneTrackerController::run_descend_state()
     publish_full_trajectory_setpoint(static_cast<float>(descend_vel.x()),
                                      static_cast<float>(descend_vel.y()),
                                      static_cast<float>(descend_vel.z()),
-                                     0.0f, 0.0f, 0.0f);
+                                     0.0f, 0.0f, 0.0f, locked_yaw_);
     if (std::abs(pos_error.z()) < 0.3) {
         // RCLCPP_INFO(this->get_logger(), "Close to ground, sending LAND command.");
         publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
@@ -877,6 +881,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
     _vehicle_velocity_ned = Eigen::Vector3d(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
     _last_odometry_stamp = this->now();
     
+    current_yaw_ = std::atan2(2.0 * (msg->q[0] * msg->q[3] + msg->q[1] * msg->q[2]), 
+                              1.0 - 2.0 * (msg->q[2] * msg->q[2] + msg->q[3] * msg->q[3]));
+
     odom_received_ = true;
     odom_count_++;
 
@@ -935,7 +942,8 @@ void DroneTrackerController::publish_trajectory_setpoint(float x, float y, float
 }
 
 void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy, float vz,
-                                                              float ax, float ay, float az)
+                                                              float ax, float ay, float az,
+                                                              float yaw)
 {
     px4_msgs::msg::TrajectorySetpoint msg{};
     msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
@@ -949,7 +957,7 @@ void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy
     msg.acceleration = {ax, ay, az};
 
     // yaw 不用：NaN
-    msg.yaw = NaN;
+    msg.yaw = yaw;
 
     trajectory_setpoint_publisher_->publish(msg);
 
