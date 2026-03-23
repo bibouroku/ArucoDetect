@@ -243,6 +243,7 @@ private:
     std::unique_ptr<DisturbanceObserver> dob_; // X轴观测器
     std::unique_ptr<DisturbanceObserver> dob_y_; // Y轴观测器
     Eigen::Vector3d _last_cmd_accel; // 记录上一时刻的指令
+    Eigen::Vector3d fe_hat;
     
     // --- DOB 相关成员变量 ---
     Eigen::Vector3d _last_vehicle_velocity;     // 上一帧的无人机速度（用于计算加速度）

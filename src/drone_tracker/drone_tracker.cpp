@@ -143,6 +143,10 @@ void DroneTrackerController::print_debug_panel()
     << "  vz=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.z() << "\n"
     << "Current Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (current_yaw_ * 180.0 / M_PI) << "\n"
     << "Locked Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (locked_yaw_ * 180.0 / M_PI) << "\n"
+    << "Estimate Wind force [N]: "
+    << "fx=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.x()
+    << "  fy=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.y()
+    << "  fz=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.z() << "\n"
     << std::flush;
 
     first_print = false;
@@ -504,38 +508,38 @@ void DroneTrackerController::run_tracking_state()
     v_cmd.z() = std::clamp(v_cmd.z(), -vz_max,  vz_max);
 
     // 4) DOB：估计外扰并作为加速度前馈补偿（只补偿 XY）
-    // Eigen::Vector3d current_accel = _vehicle_accel_ned;
+    Eigen::Vector3d current_accel = _vehicle_accel_ned;
     // 2. 获取当前旋转矩阵 R (将四元数转为 Eigen::Matrix3d)
-    // Eigen::Matrix3d R_body_to_earth = _vehicle_orientation.toRotationMatrix();
+    Eigen::Matrix3d R_body_to_earth = _vehicle_orientation.toRotationMatrix();
 
     // 2) 推力幅值 u_f（如果没有真实反馈，先用 hover 近似 + 简单修正）
     // 最保守：直接用悬停推力（适合你“只想估风力”且机动不大）：
-    // double u_f = _hover_thrust_norm * _max_thrust_newton;
+    double u_f = _hover_thrust_norm * _max_thrust_newton;
 
     // 3. 获取当前总推力 (单位：牛顿)
     // 推力 = 标准化推力 × 最大推力
     // 注意：这里 _current_normalized_thrust 是从 PX4 的油门指令反推的
     // 简化方案：假设我们发送的加速度指令会被 PX4 转换为相应的推力
     // 更准确的做法是从 PX4 的实际推力反馈获取，但这里先使用估计值
-    //double thrust_newton = _current_normalized_thrust * _max_thrust_newton;
+    // double thrust_newton = _current_normalized_thrust * _max_thrust_newton;
 
     // --- 正确调用 DOB 更新 (对应论文公式 15) ---
     // DOB 观测器需要：当前加速度、旋转矩阵、推力
-    // dob_->update(current_accel, R_body_to_earth, u_f);
-    // Eigen::Vector3d fe_hat = dob_->getDisturbanceForce();   // N
+    dob_->update(current_accel, R_body_to_earth, u_f);
+    fe_hat = dob_->getDisturbanceForce();   // N
     // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 50,
     //     "[DOB] fe_hat[N] = [%.2f, %.2f, %.2f], u_f=%.2f N, accel=[%.2f, %.2f, %.2f]",
     //     fe_hat.x(), fe_hat.y(), fe_hat.z(),
     //     u_f,
     //     current_accel.x(), current_accel.y(), current_accel.z());
     // 获取估计的干扰力，换算成补偿加速度
-    // Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
-    // Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
+    Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
+    Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
 
 
     // 注意符号：补偿时取负号；只补偿 XY，Z=0
-    // Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
-    Eigen::Vector3d a_ff = Eigen::Vector3d::Zero(); // 目前不使用 DOB 补偿，保持加速度前馈为0
+    Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
+    // Eigen::Vector3d a_ff = Eigen::Vector3d::Zero(); // 目前不使用 DOB 补偿，保持加速度前馈为0
     // 5) 发送速度 + 加速度（position 全 NaN，由 publish_full_trajectory_setpoint 保证）
     publish_full_trajectory_setpoint(static_cast<float>(v_cmd.x()),
                                      static_cast<float>(v_cmd.y()),
