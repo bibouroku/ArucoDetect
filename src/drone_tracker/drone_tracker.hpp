@@ -204,6 +204,7 @@ private:
 
     void print_debug_panel();
     const char* state_to_string(State state) const;
+    double wrap_pi(double angle) const;
 
     
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
