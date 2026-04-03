@@ -5,6 +5,57 @@ static constexpr double STATIONARY_DURATION_S = 5.0;   // 5秒，静止超过这
 
 using namespace std::chrono_literals; // 为了使用 30ms 这样的时间字面量
 
+LSWindEstimator::LSWindEstimator()
+{
+    coefficients_ <<
+        1.07371385e-03, 2.98731275e-03, 3.79590340e-02, 5.44938431e-02,
+        3.97289142e-07, 3.59210473e-07, -3.14816205e-07, -6.45351833e-07;
+
+    intercept_ = 1.3114249058990026;
+}
+
+double LSWindEstimator::estimate_total_thrust(const std::array<float,4>& motor_speed, double battery) const
+{
+    const double ba = battery * battery;
+
+    const double w1 = motor_speed[0] * ba;
+    const double w2 = motor_speed[1] * ba;
+    const double w3 = motor_speed[2] * ba;
+    const double w4 = motor_speed[3] * ba;
+
+    const double w12 = w1 * w1 * ba;
+    const double w22 = w2 * w2 * ba;
+    const double w32 = w3 * w3 * ba;
+    const double w42 = w4 * w4 * ba;
+
+    Eigen::Matrix<double, 1, 8> W;
+    W << w1, w2, w3, w4, w12, w22, w32, w42;
+
+    double f = (W * coefficients_.transpose())(0, 0);
+    f += intercept_;
+    return f;
+}
+
+Eigen::Vector3d LSWindEstimator::estimate_wind_force(const std::array<float, 4> &motor_speed,
+                                                     double battery,
+                                                     const Eigen::Quaterniond &q,
+                                                     const Eigen::Vector3d &acceleration) const
+{
+    const double f = estimate_total_thrust(motor_speed, battery);
+
+    Eigen::Matrix3d R = q.toRotationMatrix();
+
+    // 四旋翼推力在机体系通常沿 -zb 方向
+    Eigen::Vector3d thrust_world = -f * R.col(2);
+
+
+    // fw = acceleration - [0,0,9.8] - fa
+    Eigen::Vector3d gravity_ned(0.0, 0.0, 9.8);
+    Eigen::Vector3d thrust_accel = thrust_world / 2.0; // 这里假设推力加速度为 thrust_world / mass，mass 约为 2kg，所以除以2得到加速度
+    Eigen::Vector3d fw = acceleration - gravity_ned - thrust_accel;
+    return fw;
+}
+
 DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controller"),current_state(State::IDLE) // 初始化节点名称
 {
     offboard_control_mode_publisher_ = this->create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
@@ -115,6 +166,20 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
             // 如果你仍然觉得有噪声，可以在这里加个轻微的低通滤波，但通常不需要
             // _vehicle_accel_ned = getFilteredAcceleration(_vehicle_accel_ned);
         });
+
+    ls_wind_estimator_ = std::make_unique<LSWindEstimator>();
+
+    wind_k_ = this->declare_parameter<double>("wind_est.wind_k", 1.5);
+    average_size_ = this->declare_parameter<int>("wind_est.average_size", 3);
+    send_force_flag_ = false;
+    start_collect_ = true;
+    battery_voltage_ = 0.0;
+    wind_force_est_.setZero();
+
+    data_collect_sub_ = this->create_subscription<px4_msgs::msg::DataCollect>(
+        "/fmu/out/data_collect",
+        sensor_qos,
+        std::bind(&DroneTrackerController::data_collect_callback, this, std::placeholders::_1));
     timer_ = this->create_wall_timer(30ms, std::bind(&DroneTrackerController::run_state_machine, this));
 }
 
@@ -124,6 +189,10 @@ void DroneTrackerController::print_debug_panel()
     geometry_msgs::msg::PoseWithCovarianceStamped pos = filtered_pose;
     Eigen::Vector3d vel = _vehicle_velocity_ned;
     const char* state_str = state_to_string(current_state);
+    double  x_diff = _vehicle_position_ned.x() - filtered_pose.pose.pose.position.x;
+    double  y_diff = _vehicle_position_ned.y() - filtered_pose.pose.pose.position.y;
+    double  z_diff = _vehicle_position_ned.z() - filtered_pose.pose.pose.position.z;
+
     if (!first_print)
     {
         // 回到前6行，覆盖之前的输出
@@ -141,12 +210,21 @@ void DroneTrackerController::print_debug_panel()
     << "vx=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.x() 
     << "  vy=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.y()
     << "  vz=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.z() << "\n"
+    << "Position Diff to Vehicle [m]: "
+    << "dx=" << std::fixed << std::setw(8) << std::setprecision(3) << x_diff
+    << "  dy=" << std::fixed << std::setw(8) << std::setprecision(3) << y_diff
+    << "  dz=" << std::fixed << std::setw(8) << std::setprecision(3) << z_diff << "\n"
     << "Current Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (current_yaw_ * 180.0 / M_PI) << "\n"
     << "Locked Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (locked_yaw_ * 180.0 / M_PI) << "\n"
     << "Estimate Wind force [N]: "
-    << "fx=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.x()
-    << "  fy=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.y()
-    << "  fz=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.z() << "\n"
+    << "fx=" << std::fixed << std::setw(8) << std::setprecision(3) << wind_force_est_.x()
+    << "  fy=" << std::fixed << std::setw(8) << std::setprecision(3) << wind_force_est_.y()
+    << "  fz=" << std::fixed << std::setw(8) << std::setprecision(3) << wind_force_est_.z() << "\n"
+    << "Thrust World  [N]: "
+    << "thrust.x=" << std::fixed << std::setw(8) << std::setprecision(3) << thrust_world_test_.x()
+    << "  thrust.y=" << std::fixed << std::setw(8) << std::setprecision(3) << thrust_world_test_.y()
+    << "  thrust.z=" << std::fixed << std::setw(8) << std::setprecision(3) << thrust_world_test_.z() << "\n"
+    << "Total Thrust [N]: " << std::fixed << std::setw(8) << std::setprecision(3) << f_test << "\n"
     << std::flush;
 
     first_print = false;
@@ -162,59 +240,6 @@ double DroneTrackerController::wrap_pi(double angle) const
     }
     return angle;
 }
-
-// void DroneTrackerController::print_debug_panel()
-// {
-//     static bool first_print = true;
-
-//     geometry_msgs::msg::PoseWithCovarianceStamped pos = filtered_pose;
-//     Eigen::Vector3d vel = _vehicle_velocity_ned;
-//     const char* state_str = state_to_string(current_state);
-
-//     // 当前 yaw（NED）
-//     const double yaw_now_ned = current_yaw_;
-//     const double yaw_sp_ned  = locked_yaw_;
-
-//     // 转成 ENU yaw，方便和 Gazebo 画面对应
-//     const double yaw_now_enu = wrap_pi(M_PI_2 - yaw_now_ned);
-//     const double yaw_sp_enu  = wrap_pi(M_PI_2 - yaw_sp_ned);
-
-//     if (!first_print) {
-//         // 回到前 8 行，覆盖之前输出
-//         std::cout << "\033[8A";
-//     }
-
-//     // 你这里其实已经整屏清空了，所以 first_print/上移不是必须
-//     // 但我按你现在的写法保留
-//     std::cout << "\033[2J\033[H";
-
-//     std::cout
-//     << "===========================================Debug Panel===========================================\n"
-//     << "State: " << state_str << "\n"
-//     << "Position [m]:  "
-//     << "x=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.x
-//     << "  y=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.y
-//     << "  z=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.z << "\n"
-//     << "Velocity [m/s]: "
-//     << "vx=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.x()
-//     << "  vy=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.y()
-//     << "  vz=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.z() << "\n"
-//     << "Yaw NED [deg]: "
-//     << "now=" << std::fixed << std::setw(8) << std::setprecision(1) << (yaw_now_ned * 180.0 / M_PI)
-//     << "  sp=" << std::fixed << std::setw(8) << std::setprecision(1) << (yaw_sp_ned * 180.0 / M_PI) << "\n"
-//     << "Yaw ENU [deg]: "
-//     << "now=" << std::fixed << std::setw(8) << std::setprecision(1) << (yaw_now_enu * 180.0 / M_PI)
-//     << "  sp=" << std::fixed << std::setw(8) << std::setprecision(1) << (yaw_sp_enu * 180.0 / M_PI) << "\n"
-//     << "Estimate Wind force [N]: "
-//     << "fx=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.x()
-//     << "  fy=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.y()
-//     << "  fz=" << std::fixed << std::setw(8) << std::setprecision(3) << fe_hat.z() << "\n"
-//     << "===============================================================================================\n"
-//     << std::flush;
-
-//     first_print = false;
-// }
-
 
 void DroneTrackerController::run_state_machine()
 {
@@ -572,13 +597,13 @@ void DroneTrackerController::run_tracking_state()
     v_cmd.z() = std::clamp(v_cmd.z(), -vz_max,  vz_max);
 
     // 4) DOB：估计外扰并作为加速度前馈补偿（只补偿 XY）
-    Eigen::Vector3d current_accel = _vehicle_accel_ned;
+//    Eigen::Vector3d current_accel = _vehicle_accel_ned;
     // 2. 获取当前旋转矩阵 R (将四元数转为 Eigen::Matrix3d)
-    Eigen::Matrix3d R_body_to_earth = _vehicle_orientation.toRotationMatrix();
+//    Eigen::Matrix3d R_body_to_earth = _vehicle_orientation.toRotationMatrix();
 
     // 2) 推力幅值 u_f（如果没有真实反馈，先用 hover 近似 + 简单修正）
     // 最保守：直接用悬停推力（适合你“只想估风力”且机动不大）：
-    double u_f = _hover_thrust_norm * _max_thrust_newton;
+//    double u_f = _hover_thrust_norm * _max_thrust_newton;
 
     // 3. 获取当前总推力 (单位：牛顿)
     // 推力 = 标准化推力 × 最大推力
@@ -589,28 +614,26 @@ void DroneTrackerController::run_tracking_state()
 
     // --- 正确调用 DOB 更新 (对应论文公式 15) ---
     // DOB 观测器需要：当前加速度、旋转矩阵、推力
-    dob_->update(current_accel, R_body_to_earth, u_f);
-    fe_hat = dob_->getDisturbanceForce();   // N
+ //   dob_->update(current_accel, R_body_to_earth, u_f);
+ //   fe_hat = dob_->getDisturbanceForce();   // N
     // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 50,
     //     "[DOB] fe_hat[N] = [%.2f, %.2f, %.2f], u_f=%.2f N, accel=[%.2f, %.2f, %.2f]",
     //     fe_hat.x(), fe_hat.y(), fe_hat.z(),
     //     u_f,
     //     current_accel.x(), current_accel.y(), current_accel.z());
     // 获取估计的干扰力，换算成补偿加速度
-    Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
-    Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
+//   Eigen::Vector3d disturbance_force = dob_->getDisturbanceForce();
+//    Eigen::Vector3d disturbance_accel = disturbance_force / _vehicle_mass;
 
 
     // 注意符号：补偿时取负号；只补偿 XY，Z=0
-    Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
+//    Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
     // Eigen::Vector3d a_ff = Eigen::Vector3d::Zero(); // 目前不使用 DOB 补偿，保持加速度前馈为0
     // 5) 发送速度 + 加速度（position 全 NaN，由 publish_full_trajectory_setpoint 保证）
     publish_full_trajectory_setpoint(static_cast<float>(v_cmd.x()),
                                      static_cast<float>(v_cmd.y()),
                                      static_cast<float>(v_cmd.z()),
-                                     static_cast<float>(a_ff.x()),
-                                     static_cast<float>(a_ff.y()),
-                                     static_cast<float>(a_ff.z()), 
+                                     0.0f, 0.0f, 0.0f, 
                                      static_cast<float>(locked_yaw_));
     // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
     //                      "TRACKING: target_xy=[%.3f, %.3f], v_cmd=[%.3f, %.3f, %.3f], a_ff=[%.3f, %.3f]",
@@ -839,6 +862,56 @@ void DroneTrackerController::pose_callback(const geometry_msgs::msg::PoseStamped
     //     filtered_pose.pose.pose.position.z);
 
 }
+void DroneTrackerController::data_collect_callback(const px4_msgs::msg::DataCollect::SharedPtr msg)
+{
+    if (!start_collect_) {
+        return;
+    }
+
+    battery_voltage_ = msg->voltage_v;
+
+    latest_rpm_[0] = msg->rpm[0];
+    latest_rpm_[1] = msg->rpm[1];
+    latest_rpm_[2] = msg->rpm[2];
+    latest_rpm_[3] = msg->rpm[3];
+
+    latest_collect_accel_ = Eigen::Vector3d(
+        msg->acceleration[0],
+        msg->acceleration[1],
+        msg->acceleration[2]);
+
+    latest_collect_q_ = Eigen::Quaterniond(
+        msg->quaternion[0],
+        msg->quaternion[1],
+        msg->quaternion[2],
+        msg->quaternion[3]);
+
+    const double f = ls_wind_estimator_->estimate_total_thrust(latest_rpm_, battery_voltage_);
+    f_test = f;
+    Eigen::Matrix3d R = latest_collect_q_.toRotationMatrix();
+
+    // 四旋翼推力在机体系通常沿 -zb 方向
+    Eigen::Vector3d thrust_world = -f * R.col(2);
+    thrust_world_test_ = thrust_world; // 用于调试输出
+    Eigen::Vector3d raw_wind_force = ls_wind_estimator_->estimate_wind_force(latest_rpm_,
+                                                                            battery_voltage_,
+                                                                            latest_collect_q_,
+                                                                            latest_collect_accel_);
+    
+    wind_force_window_.push_back(raw_wind_force);
+    if (static_cast<int>(wind_force_window_.size()) > average_size_) {
+        wind_force_window_.pop_front();
+    }
+
+    Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+    for (const auto &w : wind_force_window_) {
+        sum += w;
+    }
+
+    if (!wind_force_window_.empty()) {
+        wind_force_est_ = (sum / static_cast<double>(wind_force_window_.size())) * wind_k_;
+    }
+}
 DroneTrackerController::ArucoTag DroneTrackerController::getTagWorld(const ArucoTag& tag_camera) {
     Eigen::Matrix3d R;
     R << 0, -1, 0,
@@ -954,7 +1027,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
 
     odom_received_ = true;
     odom_count_++;
-
+    // if (_vehicle_position_ned.z() < -0.5) {
+    //     send_force_flag_ = true;
+    // }
     base_x = msg->position[0];
     base_y = msg->position[1];
     base_z = msg->position[2];
@@ -1023,10 +1098,26 @@ void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy
 
     // 只用加速度（前馈/补偿）
     msg.acceleration = {ax, ay, az};
-
+    if (send_force_flag_) {
+        msg.wind_force = {
+            static_cast<float>(wind_force_est_.x()),
+            static_cast<float>(wind_force_est_.y()),
+            static_cast<float>(wind_force_est_.z())
+        };
+    } else {
+        msg.wind_force = {0.0f, 0.0f, 0.0f};
+    }
     // yaw 不用：NaN
     msg.yaw = yaw;
     msg.yawspeed = std::numeric_limits<float>::quiet_NaN();
+    // RCLCPP_WARN_THROTTLE(
+    // this->get_logger(),
+    // *this->get_clock(),
+    // 200,
+    // "[SEND] state=%s yaw_cmd=%.1f deg  vx=%.2f vy=%.2f vz=%.2f",
+    // state_to_string(current_state),
+    // yaw * 180.0 / M_PI,
+    // vx, vy, vz);
     trajectory_setpoint_publisher_->publish(msg);
 
     // RCLCPP_INFO_THROTTLE(this->get_logger(),*this->get_clock(), 200,

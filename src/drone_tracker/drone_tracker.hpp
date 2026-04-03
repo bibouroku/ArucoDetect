@@ -16,7 +16,7 @@
 
 #define X_DIST 0.0
 #define Y_DIST 0.0
-#define HEIGHT -3
+#define HEIGHT -2.5
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
@@ -44,6 +44,9 @@ using namespace px4_msgs::msg;
 #include <Eigen/Dense>
 #include <fstream>
 #include <iomanip>
+#include <deque>
+#include <array>
+#include <px4_msgs/msg/data_collect.hpp>
 
 using namespace std::chrono_literals;
 
@@ -106,6 +109,19 @@ private:
     Eigen::Vector3d alpha_;
     Eigen::Vector3d fe_hat_;
 };
+
+class LSWindEstimator
+{
+public:
+    LSWindEstimator();
+    double estimate_total_thrust(const std::array<float,4>& motor_speed, double battery) const;
+    Eigen::Vector3d estimate_wind_force(const std::array<float,4>& motor_speed, double battery, const Eigen::Quaterniond& q, const Eigen::Vector3d& acceleration) const;
+
+private:
+    Eigen::Matrix<double, 1, 8> coefficients_;
+    double intercept_{};
+};
+
 
 class DroneTrackerController : public rclcpp::Node
 {
@@ -251,7 +267,29 @@ private:
     double _vehicle_mass = 2.0;                 // 无人机质量 (kg)，需要根据实际情况调整
     double _hover_thrust_norm = 0.5;            // 悬停时的标准化推力 (0-1)
     double _max_thrust_newton = 19.6;           // 最大推力 (牛顿)，= _vehicle_mass * 9.81 * 1.0
+
+    //LS 风估计器
+    rclcpp::Subscription<px4_msgs::msg::DataCollect>::SharedPtr data_collect_sub_;
+    std::unique_ptr<LSWindEstimator> ls_wind_estimator_;
+    std::deque<Eigen::Vector3d> wind_force_window_; // 用于平滑风力估计的窗口
+    Eigen::Vector3d wind_force_est_{Eigen::Vector3d::Zero()}; // 当前风力估计
+
+    std::array<float, 4> latest_rpm_{0.f, 0.f, 0.f, 0.f}; // 存储最新的电机转速
+    double battery_voltage_ = 0.0;
+
+    bool send_force_flag_{false};
+    bool start_collect_{true};
+    int average_size_{3};
+    double wind_k_{1.5};
+
+    Eigen::Vector3d thrust_world_test_{Eigen::Vector3d::Zero()}; // 用于调试的推力变量
+    double f_test = 0.0;
     
+    Eigen::Vector3d latest_collect_accel_{Eigen::Vector3d::Zero()}; // 存储最新的加速度数据
+    Eigen::Quaterniond latest_collect_q_{Eigen::Quaterniond::Identity()};
+
+    void data_collect_callback(const px4_msgs::msg::DataCollect::SharedPtr msg);
+
     // --- PD 控制器参数 ---
     double _kp = 1.0;                           // 位置增益
     double _kd = 2.0;                           // 速度增益
