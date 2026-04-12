@@ -118,7 +118,7 @@ public:
     Eigen::Vector3d estimate_wind_force(const std::array<float,4>& motor_speed, double battery, const Eigen::Quaterniond& q, const Eigen::Vector3d& acceleration) const;
 
 private:
-    Eigen::Matrix<double, 1, 8> coefficients_;
+    Eigen::Matrix<double, 1, 6> coefficients_;
     double intercept_{};
 };
 

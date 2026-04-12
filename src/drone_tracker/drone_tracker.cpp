@@ -7,29 +7,39 @@ using namespace std::chrono_literals; // 为了使用 30ms 这样的时间字面
 
 LSWindEstimator::LSWindEstimator()
 {
-    coefficients_ <<
-        1.07371385e-03, 2.98731275e-03, 3.79590340e-02, 5.44938431e-02,
-        3.97289142e-07, 3.59210473e-07, -3.14816205e-07, -6.45351833e-07;
+    // coefficients_ <<
+    //     1.07371385e-03, 2.98731275e-03, 3.79590340e-02, 5.44938431e-02,
+    //     3.97289142e-07, 3.59210473e-07, -3.14816205e-07, -6.45351833e-07;
 
-    intercept_ = 1.3114249058990026;
+    coefficients_ <<
+    1.447577216088e+01,
+    -2.036431578538e+02,
+    1.303919274153e+01,
+    -1.220131574495e+00,
+    -8.404555480469e-01,
+    1.255071559577e+01;
+
+    // intercept_ = 1.3114249058990026;
+    intercept_ = 1.263397908878e+02;
 }
 
 double LSWindEstimator::estimate_total_thrust(const std::array<float,4>& motor_speed, double battery) const
 {
-    const double ba = battery * battery;
+    const double u0 = motor_speed[0];
+    const double u1 = motor_speed[1];
+    const double u2 = motor_speed[2];
+    const double u3 = motor_speed[3];
 
-    const double w1 = motor_speed[0] * ba;
-    const double w2 = motor_speed[1] * ba;
-    const double w3 = motor_speed[2] * ba;
-    const double w4 = motor_speed[3] * ba;
+    const double sum_u = u0 + u1 + u2 + u3;
+    const double sum_u2 = u0*u0 + u1*u1 + u2*u2 + u3*u3;
 
-    const double w12 = w1 * w1 * ba;
-    const double w22 = w2 * w2 * ba;
-    const double w32 = w3 * w3 * ba;
-    const double w42 = w4 * w4 * ba;
-
-    Eigen::Matrix<double, 1, 8> W;
-    W << w1, w2, w3, w4, w12, w22, w32, w42;
+    Eigen::Matrix<double, 1, 6> W;
+    W << sum_u,
+         sum_u2,
+         battery,
+         battery * battery,
+         sum_u * battery,
+         sum_u2 * battery;
 
     double f = (W * coefficients_.transpose())(0, 0);
     f += intercept_;
@@ -244,7 +254,7 @@ double DroneTrackerController::wrap_pi(double angle) const
 void DroneTrackerController::run_state_machine()
 {
     // ==================== TEST MODE: 仅测试位姿解算，禁止飞控 ====================
-    // 说明：此时设置 ENABLE_FLIGHT_CONTROL 为 false 以禁止无人机飞起来
+    // 说明：此时设置 ENABLE_FLIGHT_CONTROL 为 false 以禁止无人机飞起来 
     // 只运行位姿解算、卡尔曼滤波和数据发布，便于验证位姿准确性
     
     static constexpr bool ENABLE_FLIGHT_CONTROL = true;  // ← 改为 true 时启用飞控
@@ -419,7 +429,7 @@ void DroneTrackerController::run_holding_state()
 
     publish_full_trajectory_setpoint(vx_sp, vy_sp, vz_sp,
                                a_ff.x(), a_ff.y(), a_ff.z(), static_cast<float>(locked_yaw_));
-
+      
     if (t >= hold_duration_sec_) {
         switchToState(State::TRACKING);
     }
@@ -429,6 +439,87 @@ void DroneTrackerController::run_holding_state()
     // hold_pos_ned_.z(),
     // e.z(),
     // v_sp.z());
+        // ==================== 数据采集激励段 ====================
+    // 建议：先悬停稳定几秒，再做小幅上/下/前/后/左/右运动
+    // 注意：这里的速度是在 NED/world 坐标系下发送的
+    // x: 前后（取决于你当前世界系定义）
+    // y: 左右
+    // z: 向下为正，所以“上升”要给负速度
+
+    // double vx_exc = 0.0;
+    // double vy_exc = 0.0;
+    // double vz_exc = 0.0;
+
+    // // 激励参数（你可以后面再调）
+    // const double excite_vxy = 0.25;   // 水平小幅速度，m/s
+    // const double excite_vz  = 0.30;   // 垂直小幅速度，m/s
+    // const double phase_time = 8.0;    // 每个阶段持续时间，s
+    // const double settle_time = 10.0;   // 先稳定悬停 10 秒再开始采集
+
+    // // 时序：
+    // // 0~5s      悬停稳定
+    // // 5~7s      小幅上升
+    // // 7~9s      小幅下降 
+    // // 9~11s     前
+    // // 11~13s    后
+    // // 13~15s    左
+    // // 15~17s    右
+    // // 17~19s    悬停恢复
+    // // >19s      切换 TRACKING
+
+    // if (t >= settle_time && t < settle_time + phase_time) {
+    //     // 小幅上升：NED 下 z 向下为正，因此上升给负 vz
+    //     vz_exc = -excite_vz;
+
+    // } else if (t >= settle_time + phase_time &&
+    //         t < settle_time + 2.0 * phase_time) {
+    //     // 小幅下降
+    //     vz_exc = excite_vz;
+
+    // } else if (t >= settle_time + 2.0 * phase_time &&
+    //         t < settle_time + 3.0 * phase_time) {
+    //     // 前
+    //     vx_exc = excite_vxy;
+
+    // } else if (t >= settle_time + 3.0 * phase_time &&
+    //         t < settle_time + 4.0 * phase_time) {
+    //     // 后
+    //     vx_exc = -excite_vxy;
+
+    // } else if (t >= settle_time + 4.0 * phase_time &&
+    //         t < settle_time + 5.0 * phase_time) {
+    //     // 左 / 右 的正负取决于你现在 NED 下的 y 定义
+    //     // 先给一个方向，实测不对就交换正负
+    //     vy_exc = -excite_vxy;
+
+    // } else if (t >= settle_time + 5.0 * phase_time &&
+    //         t < settle_time + 6.0 * phase_time) {
+    //     vy_exc = excite_vxy;
+    // }
+
+    // // 把激励叠加到 holding 的基础 PI 输出上
+    // double vx_cmd = vx_sp + vx_exc;
+    // double vy_cmd = vy_sp + vy_exc;
+    // double vz_cmd = vz_sp + vz_exc;
+
+    // // 再做一次总限幅，防止叠加后过大
+    // vx_cmd = std::clamp(vx_cmd, -0.35, 0.35);
+    // vy_cmd = std::clamp(vy_cmd, -0.35, 0.35);
+    // vz_cmd = std::clamp(vz_cmd, -0.8, 0.8);
+
+    // publish_full_trajectory_setpoint(static_cast<float>(vx_cmd),
+    //                                 static_cast<float>(vy_cmd),
+    //                                 static_cast<float>(vz_cmd),
+    //                                 static_cast<float>(a_ff.x()),
+    //                                 static_cast<float>(a_ff.y()),
+    //                                 static_cast<float>(a_ff.z()),
+    //                                 static_cast<float>(locked_yaw_));
+
+    // 全部激励完成后再进入 TRACKING
+    //const double total_hold_test_time = settle_time + 7.0 * phase_time;
+    // if (t >= total_hold_test_time) {
+    //     switchToState(State::TRACKING);
+    // }
 }
 
 void DroneTrackerController::run_tracking_state()
@@ -1027,9 +1118,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
 
     odom_received_ = true;
     odom_count_++;
-    // if (_vehicle_position_ned.z() < -0.5) {
-    //     send_force_flag_ = true;
-    // }
+    if (_vehicle_position_ned.z() < -0.5) {
+        send_force_flag_ = true;
+    }
     base_x = msg->position[0];
     base_y = msg->position[1];
     base_z = msg->position[2];
