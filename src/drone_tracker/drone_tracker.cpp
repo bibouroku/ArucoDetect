@@ -1,5 +1,7 @@
 #include "drone_tracker.hpp"
 
+#include <sstream>
+
 static constexpr double STATIONARY_THRESHOLD_M = 0.05; // 5厘米，位置变化小于这个值被认为是静止
 static constexpr double STATIONARY_DURATION_S = 5.0;   // 5秒，静止超过这个时间触发降落
 
@@ -77,6 +79,12 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
     //初始化滤波后位姿发布方
     pj_est_velocity_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/tracking/estimated_velocity", 10);
     pj_filtered_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/tracking/filtered_pose", 10);
+    tracking_error_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/tracking/error", 10);
+    tracking_cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/tracking/cmd_vel", 10);
+    tracking_acc_ff_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/tracking/acc_ff", 10);
+    tracking_dob_ff_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/tracking/dob_ff", 10);
+    tracking_target_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/tracking/target_pose_world", 10);
+    tracking_state_pub_ = this->create_publisher<std_msgs::msg::String>("/tracking/state", 10);
 
     auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
     subscription_ = this->create_subscription<geometry_msgs::msg::PoseStamped>("/target_pose",qos,std::bind(&DroneTrackerController::pose_callback, this, std::placeholders::_1));
@@ -190,7 +198,148 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
         "/fmu/out/data_collect",
         sensor_qos,
         std::bind(&DroneTrackerController::data_collect_callback, this, std::placeholders::_1));
+
+    dob_accel_sub_ = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+    "/data_collect_dob/disturbance_acceleration_earth",
+    rclcpp::QoS(10),
+    [this](const geometry_msgs::msg::Vector3Stamped::SharedPtr msg) {
+        dob_wind_ff_ = Eigen::Vector3d(msg->vector.x, msg->vector.y, msg->vector.z);
+        last_dob_stamp_ = msg->header.stamp;
+    });
+    initialize_csv_logger();
     timer_ = this->create_wall_timer(30ms, std::bind(&DroneTrackerController::run_state_machine, this));
+}
+
+void DroneTrackerController::initialize_csv_logger()
+{
+    csv_enabled_ = this->declare_parameter<bool>("logging.enable_csv", true);
+    csv_path_ = this->declare_parameter<std::string>("logging.csv_path", "/tmp/drone_tracker_log_no_dob.csv");
+    csv_flush_every_ = static_cast<std::size_t>(std::max<int64_t>(1, this->declare_parameter<int64_t>("logging.csv_flush_every", 10)));
+
+    if (!csv_enabled_) {
+        RCLCPP_INFO(this->get_logger(), "CSV logging disabled by parameter logging.enable_csv=false");
+        return;
+    }
+
+    try {
+        std::filesystem::path log_path(csv_path_);
+        if (log_path.has_parent_path()) {
+            std::filesystem::create_directories(log_path.parent_path());
+        }
+        const bool file_exists = std::filesystem::exists(log_path);
+        csv_file_.open(csv_path_, std::ios::out | std::ios::app);
+        if (!csv_file_.is_open()) {
+            csv_enabled_ = false;
+            RCLCPP_ERROR(this->get_logger(), "Failed to open CSV log file: %s", csv_path_.c_str());
+            return;
+        }
+        csv_header_written_ = file_exists && std::filesystem::file_size(log_path) > 0;
+        if (!csv_header_written_) {
+            csv_file_
+                << "time_s,state,target_valid,"
+                << "uav_x,uav_y,uav_z,uav_vx,uav_vy,uav_vz,uav_yaw,"
+                << "target_x,target_y,target_z,target_vx,target_vy,target_vz,"
+                << "err_x,err_y,err_z,"
+                << "cmd_vx,cmd_vy,cmd_vz,cmd_ax,cmd_ay,cmd_az,"
+                << "dob_ff_x,dob_ff_y,dob_ff_z,"
+                << "raw_x,raw_y,raw_z,filtered_x,filtered_y,filtered_z,"
+                << "offboard_enablorce_flag,battery_v\n";
+            csv_header_written_ = true;
+            csv_file_.flush();
+        }
+        RCLCPP_INFO(this->get_logger(), "CSV logging to %s", csv_path_.c_str());
+    } catch (const std::exception &e) {
+        csv_enabled_ = false;
+        RCLCPP_ERROR(this->get_logger(), "Failed to initialize CSV logger: %s", e.what());
+    }
+}
+
+void DroneTrackerController::publish_logging_topics()
+{
+    const auto now = this->now();
+
+    geometry_msgs::msg::Vector3Stamped err_msg;
+    err_msg.header.stamp = now;
+    err_msg.header.frame_id = "ned";
+    err_msg.vector.x = latest_tracking_error_.x();
+    err_msg.vector.y = latest_tracking_error_.y();
+    err_msg.vector.z = latest_tracking_error_.z();
+    tracking_error_pub_->publish(err_msg);
+
+    geometry_msgs::msg::TwistStamped cmd_msg;
+    cmd_msg.header = err_msg.header;
+    cmd_msg.twist.linear.x = latest_cmd_velocity_.x();
+    cmd_msg.twist.linear.y = latest_cmd_velocity_.y();
+    cmd_msg.twist.linear.z = latest_cmd_velocity_.z();
+    tracking_cmd_vel_pub_->publish(cmd_msg);
+
+    geometry_msgs::msg::Vector3Stamped acc_msg;
+    acc_msg.header = err_msg.header;
+    acc_msg.vector.x = latest_cmd_acceleration_.x();
+    acc_msg.vector.y = latest_cmd_acceleration_.y();
+    acc_msg.vector.z = latest_cmd_acceleration_.z();
+    tracking_acc_ff_pub_->publish(acc_msg);
+
+    geometry_msgs::msg::Vector3Stamped dob_msg;
+    dob_msg.header = err_msg.header;
+    dob_msg.vector.x = latest_cmd_dob_ff_.x();
+    dob_msg.vector.y = latest_cmd_dob_ff_.y();
+    dob_msg.vector.z = latest_cmd_dob_ff_.z();
+    tracking_dob_ff_pub_->publish(dob_msg);
+
+    geometry_msgs::msg::PoseStamped target_msg;
+    target_msg.header = err_msg.header;
+    target_msg.pose.position.x = latest_target_position_.x();
+    target_msg.pose.position.y = latest_target_position_.y();
+    target_msg.pose.position.z = latest_target_position_.z();
+    tracking_target_pose_pub_->publish(target_msg);
+
+    std_msgs::msg::String state_msg;
+    state_msg.data = state_to_string(current_state);
+    tracking_state_pub_->publish(state_msg);
+}
+
+void DroneTrackerController::write_csv_row()
+{
+    if (!csv_enabled_ || !csv_file_.is_open()) {
+        return;
+    }
+
+    const double now_s = this->now().seconds();
+    const bool filtered_valid = kf_filter_ && kf_filter_->isInitialized();
+
+    double raw_x = _tag.position.x();
+    double raw_y = _tag.position.y();
+    double raw_z = _tag.position.z();
+    double filt_x = filtered_valid ? filtered_pose.pose.pose.position.x : std::numeric_limits<double>::quiet_NaN();
+    double filt_y = filtered_valid ? filtered_pose.pose.pose.position.y : std::numeric_limits<double>::quiet_NaN();
+    double filt_z = filtered_valid ? filtered_pose.pose.pose.position.z : std::numeric_limits<double>::quiet_NaN();
+
+    csv_file_
+        << std::fixed << std::setprecision(6)
+        << now_s << ','
+        << state_to_string(current_state) << ','
+        << (target_valid_ ? 1 : 0) << ','
+        << _vehicle_position_ned.x() << ',' << _vehicle_position_ned.y() << ',' << _vehicle_position_ned.z() << ','
+        << _vehicle_velocity_ned.x() << ',' << _vehicle_velocity_ned.y() << ',' << _vehicle_velocity_ned.z() << ','
+        << current_yaw_ << ','
+        << latest_target_position_.x() << ',' << latest_target_position_.y() << ',' << latest_target_position_.z() << ','
+        << latest_target_velocity_ff_.x() << ',' << latest_target_velocity_ff_.y() << ',' << latest_target_velocity_ff_.z() << ','
+        << latest_tracking_error_.x() << ',' << latest_tracking_error_.y() << ',' << latest_tracking_error_.z() << ','
+        << latest_cmd_velocity_.x() << ',' << latest_cmd_velocity_.y() << ',' << latest_cmd_velocity_.z() << ','
+        << latest_cmd_acceleration_.x() << ',' << latest_cmd_acceleration_.y() << ',' << latest_cmd_acceleration_.z() << ','
+        << latest_cmd_dob_ff_.x() << ',' << latest_cmd_dob_ff_.y() << ',' << latest_cmd_dob_ff_.z() << ','
+        << raw_x << ',' << raw_y << ',' << raw_z << ','
+        << filt_x << ',' << filt_y << ',' << filt_z << ','
+        << (c_mode.flag_control_offboard_enabled ? 1 : 0) << ','
+        << (send_force_flag_ ? 1 : 0) << ','
+        << battery_voltage_
+        << '\n';
+
+    ++csv_rows_written_;
+    if (csv_rows_written_ % csv_flush_every_ == 0) {
+        csv_file_.flush();
+    }
 }
 
 void DroneTrackerController::print_debug_panel()
@@ -226,15 +375,10 @@ void DroneTrackerController::print_debug_panel()
     << "  dz=" << std::fixed << std::setw(8) << std::setprecision(3) << z_diff << "\n"
     << "Current Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (current_yaw_ * 180.0 / M_PI) << "\n"
     << "Locked Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (locked_yaw_ * 180.0 / M_PI) << "\n"
-    << "Estimate Wind force [N]: "
-    << "fx=" << std::fixed << std::setw(8) << std::setprecision(3) << wind_force_est_.x()
-    << "  fy=" << std::fixed << std::setw(8) << std::setprecision(3) << wind_force_est_.y()
-    << "  fz=" << std::fixed << std::setw(8) << std::setprecision(3) << wind_force_est_.z() << "\n"
-    << "Thrust World  [N]: "
-    << "thrust.x=" << std::fixed << std::setw(8) << std::setprecision(3) << thrust_world_test_.x()
-    << "  thrust.y=" << std::fixed << std::setw(8) << std::setprecision(3) << thrust_world_test_.y()
-    << "  thrust.z=" << std::fixed << std::setw(8) << std::setprecision(3) << thrust_world_test_.z() << "\n"
-    << "Total Thrust [N]: " << std::fixed << std::setw(8) << std::setprecision(3) << f_test << "\n"
+    << "Estimate Wind acceleration [N]: "
+    << "ax=" << std::fixed << std::setw(8) << std::setprecision(3) << dob_wind_ff_.x()
+    << "  ay=" << std::fixed << std::setw(8) << std::setprecision(3) << dob_wind_ff_.y()
+    << "  az=" << std::fixed << std::setw(8) << std::setprecision(3) << dob_wind_ff_.z() << "\n"
     << std::flush;
 
     first_print = false;
@@ -295,6 +439,8 @@ void DroneTrackerController::run_state_machine()
         //     run_landed_state();
         //     break;
     }
+    publish_logging_topics();
+    write_csv_row();
     print_debug_panel();
 }
 
@@ -330,6 +476,14 @@ void DroneTrackerController::run_holding_state()
 
     if (!odom_received_ || odom_count_ < 20){
         // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Waiting for odometry data... Received %d messages", odom_count_);
+        latest_target_position_ = _vehicle_position_ned;
+        latest_target_velocity_ff_.setZero();
+        latest_tracking_error_.setZero();
+        latest_cmd_velocity_.setZero();
+        latest_cmd_acceleration_.setZero();
+        latest_cmd_dob_ff_.setZero();
+        latest_cmd_yaw_ = current_yaw_;
+        target_valid_ = false;
         publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, static_cast<float>(current_yaw_)); // 发布零速度和零加速度的设定点，保持当前位置
         return;
     }
@@ -345,6 +499,15 @@ void DroneTrackerController::run_holding_state()
         // hold_pos_ned_.z() = HEIGHT;   // 你的 HEIGHT 是固定高度（NED）
         hold_int_err_.setZero();
         locked_yaw_ = current_yaw_; // 锁定当前航向角
+        latest_target_position_ = _vehicle_position_ned;
+        latest_target_position_.z() = HEIGHT;
+        latest_target_velocity_ff_.setZero();
+        latest_tracking_error_.setZero();
+        latest_cmd_velocity_.setZero();
+        latest_cmd_acceleration_.setZero();
+        latest_cmd_dob_ff_.setZero();
+        latest_cmd_yaw_ = locked_yaw_;
+        target_valid_ = false;
         publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, static_cast<float>(locked_yaw_)); // 发布零速度和零加速度的设定点，保持当前位置
         return;
     }
@@ -363,6 +526,15 @@ void DroneTrackerController::run_holding_state()
             hold_pos_ned_.z() = HEIGHT;
             hold_int_err_.setZero();
         }else{
+        latest_target_position_ = _vehicle_position_ned;
+        latest_target_position_.z() = HEIGHT;
+        latest_target_velocity_ff_.setZero();
+        latest_tracking_error_.setZero();
+        latest_cmd_velocity_.setZero();
+        latest_cmd_acceleration_.setZero();
+        latest_cmd_dob_ff_.setZero();
+        latest_cmd_yaw_ = locked_yaw_;
+        target_valid_ = false;
             publish_full_trajectory_setpoint(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, static_cast<float>(locked_yaw_)); // 发布零速度和零加速度的设定点，保持当前位置
             return;
         }
@@ -426,6 +598,15 @@ void DroneTrackerController::run_holding_state()
     // 如果你已经订阅了 vehicle_local_position 的加速度，建议直接用它更新DOB
     // dob_->update(_vehicle_accel_ned, R_body_to_earth, thrust_newton);
     // a_ff = - dob_->getDisturbanceAcceleration();   // 注意符号：补偿用负号
+
+    latest_target_position_ = hold_pos_ned_;
+    latest_target_velocity_ff_.setZero();
+    latest_tracking_error_ = e;
+    latest_cmd_velocity_ = Eigen::Vector3d(vx_sp, vy_sp, vz_sp);
+    latest_cmd_acceleration_ = a_ff;
+    latest_cmd_dob_ff_.setZero();
+    latest_cmd_yaw_ = locked_yaw_;
+    target_valid_ = true;
 
     publish_full_trajectory_setpoint(vx_sp, vy_sp, vz_sp,
                                a_ff.x(), a_ff.y(), a_ff.z(), static_cast<float>(locked_yaw_));
@@ -522,6 +703,7 @@ void DroneTrackerController::run_holding_state()
     // }
 }
 
+
 void DroneTrackerController::run_tracking_state()
 {
     publish_offboard_control_mode();
@@ -535,6 +717,15 @@ void DroneTrackerController::run_tracking_state()
         // 滤波器尚未初始化：先保持当前速度为 0，同时用 vz 纠正高度
         const double z_err = HEIGHT - _vehicle_position_ned.z();
         const double vz_cmd = std::clamp(_kp * z_err, -1.0, 1.0);
+        latest_target_position_ = _vehicle_position_ned;
+        latest_target_position_.z() = HEIGHT;
+        latest_target_velocity_ff_.setZero();
+        latest_tracking_error_ = Eigen::Vector3d(0.0, 0.0, z_err);
+        latest_cmd_velocity_ = Eigen::Vector3d(0.0, 0.0, vz_cmd);
+        latest_cmd_acceleration_.setZero();
+        latest_cmd_dob_ff_.setZero();
+        latest_cmd_yaw_ = locked_yaw_;
+        target_valid_ = false;
         publish_full_trajectory_setpoint(0.0f, 0.0f, static_cast<float>(vz_cmd), 0.0f, 0.0f, 0.0f, static_cast<float>(locked_yaw_));
         return;
     }
@@ -721,6 +912,18 @@ void DroneTrackerController::run_tracking_state()
 //    Eigen::Vector3d a_ff(-disturbance_accel.x(), -disturbance_accel.y(), 0.0);
     // Eigen::Vector3d a_ff = Eigen::Vector3d::Zero(); // 目前不使用 DOB 补偿，保持加速度前馈为0
     // 5) 发送速度 + 加速度（position 全 NaN，由 publish_full_trajectory_setpoint 保证）
+    latest_target_position_ = target_pos;
+    latest_target_velocity_ff_ = target_vel_ff;
+    latest_tracking_error_ = pos_error;
+    latest_cmd_velocity_ = v_cmd;
+    latest_cmd_acceleration_.setZero();
+    latest_cmd_dob_ff_ = (send_force_flag_ && use_external_dob_) ? Eigen::Vector3d(dob_ff_gain_ * dob_wind_ff_.x(), dob_ff_gain_ * dob_wind_ff_.y(), 0.0) : Eigen::Vector3d::Zero();
+    latest_cmd_dob_ff_.x() = std::clamp(latest_cmd_dob_ff_.x(), -1.5, 1.5);
+    latest_cmd_dob_ff_.y() = std::clamp(latest_cmd_dob_ff_.y(), -1.5, 1.5);
+    latest_cmd_dob_ff_.z() = 0.0;
+    latest_cmd_yaw_ = locked_yaw_;
+    target_valid_ = tag_recent;
+
     publish_full_trajectory_setpoint(static_cast<float>(v_cmd.x()),
                                      static_cast<float>(v_cmd.y()),
                                      static_cast<float>(v_cmd.z()),
@@ -831,6 +1034,15 @@ void DroneTrackerController::run_descend_state()
     descend_vel.x() = std::clamp(descend_vel.x(), -vxy_max, vxy_max);
     descend_vel.y() = std::clamp(descend_vel.y(), -vxy_max, vxy_max);
     descend_vel.z() = std::clamp(descend_vel.z(), -vz_max,  vz_max);
+    latest_target_position_ = target_pos;
+    latest_target_velocity_ff_.setZero();
+    latest_tracking_error_ = pos_error;
+    latest_cmd_velocity_ = descend_vel;
+    latest_cmd_acceleration_.setZero();
+    latest_cmd_dob_ff_.setZero();
+    latest_cmd_yaw_ = locked_yaw_;
+    target_valid_ = true;
+
     publish_full_trajectory_setpoint(static_cast<float>(descend_vel.x()),
                                      static_cast<float>(descend_vel.y()),
                                      static_cast<float>(descend_vel.z()),
@@ -1118,9 +1330,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
 
     odom_received_ = true;
     odom_count_++;
-    if (_vehicle_position_ned.z() < -0.5) {
-        send_force_flag_ = true;
-    }
+    // if (_vehicle_position_ned.z() < -0.5) {
+    //     send_force_flag_ = true;
+    // }
     base_x = msg->position[0];
     base_y = msg->position[1];
     base_z = msg->position[2];
@@ -1137,6 +1349,7 @@ void DroneTrackerController::publish_offboard_control_mode()
     msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
     offboard_control_mode_publisher_->publish(msg);
 }
+
 
 // void DroneTrackerController::publish_trajectory_setpoint()
 // {
@@ -1169,11 +1382,16 @@ void DroneTrackerController::publish_trajectory_setpoint(float x, float y, float
     msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
     msg.position = {static_cast<float>(x), static_cast<float>(y), z};
     msg.yaw = static_cast<float>(current_yaw_);
+    latest_cmd_velocity_.setZero();
+    latest_cmd_acceleration_.setZero();
+    latest_cmd_dob_ff_.setZero();
+    latest_cmd_yaw_ = current_yaw_;
     trajectory_setpoint_publisher_->publish(msg);
     // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
     //             "Published TrajectorySetpoint: [%.2f, %.2f, %.2f]",
     //             msg.position[0], msg.position[1], msg.position[2]);
 }
+
 
 void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy, float vz,
                                                               float ax, float ay, float az,
@@ -1189,14 +1407,35 @@ void DroneTrackerController::publish_full_trajectory_setpoint(float vx, float vy
 
     // 只用加速度（前馈/补偿）
     msg.acceleration = {ax, ay, az};
-    if (send_force_flag_) {
-        msg.wind_force = {
-            static_cast<float>(wind_force_est_.x()),
-            static_cast<float>(wind_force_est_.y()),
-            static_cast<float>(wind_force_est_.z())
-        };
+    if (send_force_flag_ && use_external_dob_) {
+        const bool dob_fresh =
+            last_dob_stamp_.nanoseconds() > 0 &&
+            ((this->now() - last_dob_stamp_).seconds() < dob_timeout_sec_);
+
+        if (dob_fresh) {
+            Eigen::Vector3d ff = dob_ff_gain_ * dob_wind_ff_;
+
+            // 建议先只开 XY，Z 先关掉更稳
+            ff.z() = 0.0;
+
+            // 建议先限幅
+            ff.x() = std::clamp(ff.x(), -2.0, 2.0);
+            ff.y() = std::clamp(ff.y(), -2.0, 2.0);
+            ff.z() = std::clamp(ff.z(), -1.0, 1.0);
+
+            msg.wind_force = {
+                static_cast<float>(ff.x()),
+                static_cast<float>(ff.y()),
+                static_cast<float>(ff.z())
+            };
+            latest_cmd_dob_ff_ = ff;
+        } else {
+            msg.wind_force = {0.0f, 0.0f, 0.0f};
+            latest_cmd_dob_ff_.setZero();
+        }
     } else {
         msg.wind_force = {0.0f, 0.0f, 0.0f};
+        latest_cmd_dob_ff_.setZero();
     }
     // yaw 不用：NaN
     msg.yaw = yaw;

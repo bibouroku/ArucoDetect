@@ -3,6 +3,7 @@
 #include <string>
 #include <cmath>
 #include <limits>
+#include <filesystem>
 
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
@@ -23,6 +24,7 @@ using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist.hpp"
+#include "geometry_msgs/msg/twist_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "tf2_ros/buffer.h"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -48,6 +50,8 @@ using namespace px4_msgs::msg;
 #include <array>
 #include <px4_msgs/msg/data_collect.hpp>
 
+#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <std_msgs/msg/string.hpp>
 using namespace std::chrono_literals;
 
 
@@ -140,6 +144,13 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pj_raw_pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pj_filtered_pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pj_est_velocity_pub_;
+
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr tracking_error_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr tracking_cmd_vel_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr tracking_acc_ff_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr tracking_dob_ff_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr tracking_target_pose_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tracking_state_pub_;
 
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
@@ -245,6 +256,9 @@ private:
     void odometry_callback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);
     void publish_vehicle_command(uint16_t command, float param1 = 0.0,float param2 = 0.0);
     ArucoTag getTagWorld(const ArucoTag& tag_camera);
+    void publish_logging_topics();
+    void initialize_csv_logger();
+    void write_csv_row();
     void switchToState(State state);
     std::string getStateName(State state);
 
@@ -257,6 +271,9 @@ private:
     void run_descend_state();
     //void run_landed_state();
 
+
+    void publish_hold_position_setpoint(float x, float y, float z, float yaw);
+    
     std::unique_ptr<DisturbanceObserver> dob_; // X轴观测器
     std::unique_ptr<DisturbanceObserver> dob_y_; // Y轴观测器
     Eigen::Vector3d _last_cmd_accel; // 记录上一时刻的指令
@@ -267,6 +284,14 @@ private:
     double _vehicle_mass = 2.0;                 // 无人机质量 (kg)，需要根据实际情况调整
     double _hover_thrust_norm = 0.5;            // 悬停时的标准化推力 (0-1)
     double _max_thrust_newton = 19.6;           // 最大推力 (牛顿)，= _vehicle_mass * 9.81 * 1.0
+
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr dob_accel_sub_;
+    Eigen::Vector3d dob_wind_ff_{Eigen::Vector3d::Zero()};
+    rclcpp::Time last_dob_stamp_{0, 0, RCL_ROS_TIME};
+
+    bool use_external_dob_{true};
+    double dob_timeout_sec_{0.15};
+    double dob_ff_gain_{1.0};
 
     //LS 风估计器
     rclcpp::Subscription<px4_msgs::msg::DataCollect>::SharedPtr data_collect_sub_;
@@ -308,5 +333,23 @@ private:
     // 加速度滤波
     Eigen::Vector3d _filtered_accel = Eigen::Vector3d::Zero();           // 滤波后的加速度
     double _accel_filter_alpha = 0.3;          // 低通滤波系数 (0.1-0.5)
+
+    
+    // ===== Logging / analysis =====
+    std::ofstream csv_file_;
+    std::string csv_path_;
+    bool csv_enabled_{true};
+    bool csv_header_written_{false};
+    std::size_t csv_flush_every_{10};
+    std::size_t csv_rows_written_{0};
+
+    Eigen::Vector3d latest_tracking_error_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d latest_target_position_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d latest_target_velocity_ff_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d latest_cmd_velocity_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d latest_cmd_acceleration_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d latest_cmd_dob_ff_{Eigen::Vector3d::Zero()};
+    float latest_cmd_yaw_{0.0f};
+    bool target_valid_{false};
 };
 
