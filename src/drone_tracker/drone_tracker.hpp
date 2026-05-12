@@ -291,7 +291,7 @@ private:
 
     bool use_external_dob_{true};
     double dob_timeout_sec_{0.15};
-    double dob_ff_gain_{1.0};
+    double dob_ff_gain_{0.5};
 
     //LS 风估计器
     rclcpp::Subscription<px4_msgs::msg::DataCollect>::SharedPtr data_collect_sub_;

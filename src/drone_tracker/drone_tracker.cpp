@@ -213,7 +213,7 @@ DroneTrackerController::DroneTrackerController() : Node("drone_tracker_controlle
 void DroneTrackerController::initialize_csv_logger()
 {
     csv_enabled_ = this->declare_parameter<bool>("logging.enable_csv", true);
-    csv_path_ = this->declare_parameter<std::string>("logging.csv_path", "/tmp/drone_tracker_log_no_dob.csv");
+    csv_path_ = this->declare_parameter<std::string>("logging.csv_path", "/tmp/drone_tracker_log_dob.csv");
     csv_flush_every_ = static_cast<std::size_t>(std::max<int64_t>(1, this->declare_parameter<int64_t>("logging.csv_flush_every", 10)));
 
     if (!csv_enabled_) {
@@ -344,44 +344,91 @@ void DroneTrackerController::write_csv_row()
 
 void DroneTrackerController::print_debug_panel()
 {
-    static bool first_print = true;
     geometry_msgs::msg::PoseWithCovarianceStamped pos = filtered_pose;
     Eigen::Vector3d vel = _vehicle_velocity_ned;
     const char* state_str = state_to_string(current_state);
-    double  x_diff = _vehicle_position_ned.x() - filtered_pose.pose.pose.position.x;
-    double  y_diff = _vehicle_position_ned.y() - filtered_pose.pose.pose.position.y;
-    double  z_diff = _vehicle_position_ned.z() - filtered_pose.pose.pose.position.z;
 
-    if (!first_print)
-    {
-        // 回到前6行，覆盖之前的输出
-        std::cout << "\033[6A"; // ANSI 转义序列：光标上移6行
-    }
+    double x_diff = _vehicle_position_ned.x() - filtered_pose.pose.pose.position.x;
+    double y_diff = _vehicle_position_ned.y() - filtered_pose.pose.pose.position.y;
+    double z_diff = _vehicle_position_ned.z() - filtered_pose.pose.pose.position.z;
+
+    // ===== 新增：用于判断“是不是一直无法进入 DESCEND” =====
+    double stationary_elapsed = (this->now() - _last_tag_move_time).seconds();
+
+    // 原始 tag 相对“上一次稳定位置”的位移
+    double distance_moved = 0.0;
+    distance_moved = (_tag.position - _last_stable_tag_position.position).norm();
+
+    bool stationary_time_ok = stationary_elapsed > STATIONARY_DURATION_S;
+    bool moved_over_thresh = distance_moved > STATIONARY_THRESHOLD_M;
+
+    // 如果你想看滤波后目标与飞机之间的水平误差，也可以顺带显示
+    double xy_err = std::sqrt(x_diff * x_diff + y_diff * y_diff);
+
+    // 如果你后面还想看“是否静止”但又担心原始 _tag 太抖，
+    // 这里也可以先把滤波位置打印出来辅助判断
+    double filt_x = filtered_pose.pose.pose.position.x;
+    double filt_y = filtered_pose.pose.pose.position.y;
+    double filt_z = filtered_pose.pose.pose.position.z;
+
+    // 清屏并回到左上角
     std::cout << "\033[2J\033[H";
+
     std::cout
-    << "===========================================Debug Panel===========================================\n"
-    << "State: " << state_str << "\n"
-    << "Position [m]:  "
-    << "x=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.x 
-    << "  y=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.y
-    << "  z=" << std::fixed << std::setw(8) << std::setprecision(3) << pos.pose.pose.position.z << "\n"
-    << "Velocity [m/s]: "
-    << "vx=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.x() 
+    << "=========================================== Debug Panel ===========================================\n"
+    << "State: " << state_str
+    << "    Target Valid: " << (target_valid_ ? "YES" : "NO") << "\n"
+
+    << "Filtered Target Position [m]: "
+    << "x=" << std::fixed << std::setw(8) << std::setprecision(3) << filt_x
+    << "  y=" << std::fixed << std::setw(8) << std::setprecision(3) << filt_y
+    << "  z=" << std::fixed << std::setw(8) << std::setprecision(3) << filt_z << "\n"
+
+    << "Vehicle Velocity [m/s]:       "
+    << "vx=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.x()
     << "  vy=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.y()
     << "  vz=" << std::fixed << std::setw(8) << std::setprecision(3) << vel.z() << "\n"
+
     << "Position Diff to Vehicle [m]: "
     << "dx=" << std::fixed << std::setw(8) << std::setprecision(3) << x_diff
     << "  dy=" << std::fixed << std::setw(8) << std::setprecision(3) << y_diff
-    << "  dz=" << std::fixed << std::setw(8) << std::setprecision(3) << z_diff << "\n"
-    << "Current Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (current_yaw_ * 180.0 / M_PI) << "\n"
-    << "Locked Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1) << (locked_yaw_ * 180.0 / M_PI) << "\n"
-    << "Estimate Wind acceleration [N]: "
+    << "  dz=" << std::fixed << std::setw(8) << std::setprecision(3) << z_diff
+    << "  xy=" << std::fixed << std::setw(8) << std::setprecision(3) << xy_err << "\n"
+
+    << "Current Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1)
+    << (current_yaw_ * 180.0 / M_PI)
+    << "    Locked Yaw [deg]: " << std::fixed << std::setw(8) << std::setprecision(1)
+    << (locked_yaw_ * 180.0 / M_PI) << "\n"
+
+    // 注意：你这里其实是加速度，不是 N
+    << "Estimated Wind Acc [m/s^2]:  "
     << "ax=" << std::fixed << std::setw(8) << std::setprecision(3) << dob_wind_ff_.x()
     << "  ay=" << std::fixed << std::setw(8) << std::setprecision(3) << dob_wind_ff_.y()
     << "  az=" << std::fixed << std::setw(8) << std::setprecision(3) << dob_wind_ff_.z() << "\n"
-    << std::flush;
 
-    first_print = false;
+    // ===== 新增：DESCEND 判定相关 =====
+    << "Stationary Timer [s]:         "
+    << "elapsed=" << std::fixed << std::setw(8) << std::setprecision(3) << stationary_elapsed
+    << "  / required=" << std::fixed << std::setw(8) << std::setprecision(3) << STATIONARY_DURATION_S
+    << "  -> " << (stationary_time_ok ? "READY" : "WAIT") << "\n"
+
+    << "Raw Tag Motion Check [m]:     "
+    << "moved=" << std::fixed << std::setw(8) << std::setprecision(3) << distance_moved
+    << "  threshold=" << std::fixed << std::setw(8) << std::setprecision(3) << STATIONARY_THRESHOLD_M
+    << "  -> " << (moved_over_thresh ? "RESET TIMER" : "STABLE") << "\n"
+
+    << "Last Stable Raw Tag Pos [m]:  "
+    << "x=" << std::fixed << std::setw(8) << std::setprecision(3) << _last_stable_tag_position.position.x()
+    << "  y=" << std::fixed << std::setw(8) << std::setprecision(3) << _last_stable_tag_position.position.y()
+    << "  z=" << std::fixed << std::setw(8) << std::setprecision(3) << _last_stable_tag_position.position.z() << "\n"
+
+    << "Current Raw Tag Pos [m]:      "
+    << "x=" << std::fixed << std::setw(8) << std::setprecision(3) << _tag.position.x()
+    << "  y=" << std::fixed << std::setw(8) << std::setprecision(3) << _tag.position.y()
+    << "  z=" << std::fixed << std::setw(8) << std::setprecision(3) << _tag.position.z() << "\n"
+
+    << "===================================================================================================\n"
+    << std::flush;
 }
 
 double DroneTrackerController::wrap_pi(double angle) const
@@ -1330,9 +1377,9 @@ void DroneTrackerController::odometry_callback(const px4_msgs::msg::VehicleOdome
 
     odom_received_ = true;
     odom_count_++;
-    // if (_vehicle_position_ned.z() < -0.5) {
-    //     send_force_flag_ = true;
-    // }
+    if (_vehicle_position_ned.z() < -0.5) {
+        send_force_flag_ = true;
+    }
     base_x = msg->position[0];
     base_y = msg->position[1];
     base_z = msg->position[2];
